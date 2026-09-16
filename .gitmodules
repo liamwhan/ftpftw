@@ -1,0 +1,6 @@
+[submodule "raddebugger"]
+	path = raddebugger
+	url = git@github.com:EpicGames/raddebugger.git
+[submodule "third_party/libssh2"]
+	path = third_party/libssh2
+	url = https://github.com/libssh2/libssh2.git
