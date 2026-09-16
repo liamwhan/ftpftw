@@ -33,11 +33,60 @@ sftp_send_error(GuardedRing *ring, char *fmt, ...)
   va_end(args);
 }
 
+// One listing operation: open `path`, stream its entries as Entry
+// messages, close, and send the terminal Done for this listing. Used both
+// for the initial connect-time listing and every subsequent on-demand one.
+internal void
+sftp_do_list(GuardedRing *ring, LIBSSH2_SFTP *sftp, char *path_cstr)
+{
+  sftp_log(ring, "opening directory '%s'", path_cstr);
+  LIBSSH2_SFTP_HANDLE *dir = libssh2_sftp_opendir(sftp, path_cstr);
+  if(dir == 0)
+  {
+    sftp_send_error(ring, "could not open remote directory '%s'", path_cstr);
+  }
+  else
+  {
+    U64 entry_count = 0;
+    for(;;)
+    {
+      U8 name_buf[SFTP_NAME_MAX];
+      LIBSSH2_SFTP_ATTRIBUTES attrs = {0};
+      int rc = libssh2_sftp_readdir(dir, (char *)name_buf, sizeof(name_buf), &attrs);
+      if(rc <= 0)
+      {
+        break;
+      }
+      SFTP_CtrlMsg msg = {0};
+      msg.kind = SFTP_CtrlMsgKind_Entry;
+      msg.name_size = Min((U64)rc, sizeof(msg.name) - 1);
+      MemoryCopy(msg.name, name_buf, msg.name_size);
+      if(attrs.flags & LIBSSH2_SFTP_ATTR_SIZE)
+      {
+        msg.size_bytes = attrs.filesize;
+      }
+      if(attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS)
+      {
+        msg.is_dir = LIBSSH2_SFTP_S_ISDIR(attrs.permissions) != 0;
+      }
+      guarded_ring_write_struct_or_wait(ring, &msg, max_U64);
+      entry_count += 1;
+    }
+    libssh2_sftp_closedir(dir);
+    sftp_log(ring, "directory listing complete (%llu entries)", entry_count);
+  }
+
+  SFTP_CtrlMsg done_msg = {0};
+  done_msg.kind = SFTP_CtrlMsgKind_Done;
+  guarded_ring_write_struct_or_wait(ring, &done_msg, max_U64);
+}
+
 internal void
 sftp_control_thread_entry(void *ptr)
 {
   SFTP_ConnectParams *params = (SFTP_ConnectParams *)ptr;
   GuardedRing *ring = params->out_ring;
+  GuardedRing *in_ring = params->in_ring;
   set_thread_name(str8_lit("sftp-control"));
 
   Temp scratch = scratch_begin(0, 0);
@@ -105,42 +154,25 @@ sftp_control_thread_entry(void *ptr)
     goto done;
   }
 
+  sftp_do_list(ring, sftp, dir_cstr);
+
+  // Stay connected and service on-demand listing requests (remote pane
+  // navigation) until asked to quit.
+  for(;;)
   {
-    sftp_log(ring, "opening directory '%s'", dir_cstr);
-    LIBSSH2_SFTP_HANDLE *dir = libssh2_sftp_opendir(sftp, dir_cstr);
-    if(dir == 0)
+    SFTP_Req req = {0};
+    guarded_ring_read_struct_or_wait(in_ring, &req, max_U64);
+    if(req.kind == SFTP_ReqKind_Quit)
     {
-      sftp_send_error(ring, "could not open remote directory '%s'", dir_cstr);
+      break;
     }
-    else
+    else if(req.kind == SFTP_ReqKind_ListDir)
     {
-      U64 entry_count = 0;
-      for(;;)
-      {
-        U8 name_buf[SFTP_NAME_MAX];
-        LIBSSH2_SFTP_ATTRIBUTES attrs = {0};
-        int rc = libssh2_sftp_readdir(dir, (char *)name_buf, sizeof(name_buf), &attrs);
-        if(rc <= 0)
-        {
-          break;
-        }
-        SFTP_CtrlMsg msg = {0};
-        msg.kind = SFTP_CtrlMsgKind_Entry;
-        msg.name_size = Min((U64)rc, sizeof(msg.name) - 1);
-        MemoryCopy(msg.name, name_buf, msg.name_size);
-        if(attrs.flags & LIBSSH2_SFTP_ATTR_SIZE)
-        {
-          msg.size_bytes = attrs.filesize;
-        }
-        if(attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS)
-        {
-          msg.is_dir = LIBSSH2_SFTP_S_ISDIR(attrs.permissions) != 0;
-        }
-        guarded_ring_write_struct_or_wait(ring, &msg, max_U64);
-        entry_count += 1;
-      }
-      libssh2_sftp_closedir(dir);
-      sftp_log(ring, "directory listing complete (%llu entries)", entry_count);
+      Temp req_scratch = scratch_begin(0, 0);
+      String8 path = str8(req.path, Min(req.path_size, sizeof(req.path)));
+      char *path_cstr = str8_to_cstring(req_scratch.arena, path);
+      sftp_do_list(ring, sftp, path_cstr);
+      scratch_end(req_scratch);
     }
   }
 
@@ -152,7 +184,51 @@ sftp_control_thread_entry(void *ptr)
 
   done:;
   scratch_end(scratch);
-  SFTP_CtrlMsg done_msg = {0};
-  done_msg.kind = SFTP_CtrlMsgKind_Done;
-  guarded_ring_write_struct_or_wait(ring, &done_msg, max_U64);
+  SFTP_CtrlMsg exit_msg = {0};
+  exit_msg.kind = SFTP_CtrlMsgKind_ThreadExit;
+  guarded_ring_write_struct_or_wait(ring, &exit_msg, max_U64);
+}
+
+internal String8
+sftp_path_join(Arena *arena, String8 dir, String8 name)
+{
+  String8 result;
+  if(str8_match(dir, str8_lit(".")))
+  {
+    result = str8_copy(arena, name);
+  }
+  else
+  {
+    B32 needs_sep = (dir.size > 0 && dir.str[dir.size - 1] != '/');
+    result = str8f(arena, "%.*s%s%.*s",
+                    (int)dir.size, (char *)dir.str,
+                    needs_sep ? "/" : "",
+                    (int)name.size, (char *)name.str);
+  }
+  return result;
+}
+
+internal String8
+sftp_path_parent(Arena *arena, String8 path)
+{
+  String8 result;
+  if(str8_match(path, str8_lit(".")))
+  {
+    result = str8_copy(arena, path); // already at the top - nowhere to go
+  }
+  else
+  {
+    S64 slash_idx = -1;
+    for(S64 i = (S64)path.size - 1; i >= 0; i -= 1)
+    {
+      if(path.str[i] == '/')
+      {
+        slash_idx = i;
+        break;
+      }
+    }
+    result = (slash_idx < 0) ? str8_copy(arena, str8_lit("."))
+                              : str8_copy(arena, str8(path.str, (U64)slash_idx));
+  }
+  return result;
 }

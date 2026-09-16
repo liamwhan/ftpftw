@@ -127,6 +127,19 @@ Mirror raddebugger's model exactly rather than reaching for
   Each active transfer runs on its own thread over its own SFTP channel, so
   a big upload/download never blocks directory listings or new commands on
   the control thread.
+- **The control connection lives for the session**, not per-operation: it
+  stays connected (servicing on-demand requests - directory navigation
+  today, transfer setup later) until the user disconnects or the remote
+  end drops it, at which point it reconnects using the stored credentials
+  rather than the app just erroring out.
+  - **Disconnect detection is reactive by default**: no idle-time
+    polling - a dead connection is discovered when the next real
+    operation on it fails, then it reconnects transparently and retries.
+  - **Exception, once transfers exist**: an *active* transfer should keep
+    the connection alive with a keepalive/no-op rather than let it go
+    idle mid-transfer and risk a server- or network-side idle timeout.
+    Don't build this before there's a transfer thread for it to attach
+    to - it's a requirement to remember for that phase, not now.
 - **Primitives**: use the raddebugger set as-is —
   `Thread`/`thread_launch`/`thread_join`, `Mutex`/`RWMutex`, `CondVar`,
   `Semaphore` — and the `MutexScope(...)`/`RWMutexScope(...)` defer-loop

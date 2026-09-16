@@ -91,9 +91,10 @@ main(void)
   ui_icons_init();
   FP_Font font = fp_font_open("Segoe UI");
 
-  Arena *arena = arena_alloc();       // app-lifetime: connect params, log lines, remote entry names
-  Arena *frame_arena = arena_alloc(); // cleared every frame
-  Arena *local_arena = arena_alloc(); // local path/listing - cleared on every navigation
+  Arena *arena = arena_alloc();        // app-lifetime: connect params, log lines
+  Arena *frame_arena = arena_alloc();  // cleared every frame
+  Arena *local_arena = arena_alloc();  // local path/listing - cleared on every navigation
+  Arena *remote_arena = arena_alloc(); // remote path/listing - cleared on every navigation
 
   // --- local pane state: starts at %USERPROFILE%, navigable -----------------
   String8 local_path = str8_copy(local_arena, env_str8(frame_arena, "USERPROFILE"));
@@ -119,6 +120,7 @@ main(void)
     str8_list_push(arena, &lines, str8_lit("set FTP_HOST, FTP_USER, FTP_PASS (and optionally FTP_PORT), then relaunch"));
   }
 
+  String8 remote_path = str8_copy(remote_arena, str8_lit("."));
   FS_Entry remote_entries_buf[MAX_REMOTE_ENTRIES];
   U64 remote_entry_count = 0;
   B32 remote_sorted = 0;
@@ -132,6 +134,7 @@ main(void)
   B32 log_auto_follow = 1;
 
   GuardedRing ring = {0};
+  GuardedRing in_ring = {0};
   SFTP_ConnectParams params = {0};
   Thread control = {0};
   B32 control_joined = 1;
@@ -140,12 +143,14 @@ main(void)
   {
     libssh2_init(0);
     ring = guarded_ring_alloc(arena, KB(64));
+    in_ring = guarded_ring_alloc(arena, KB(4));
     params.host = host;
     params.port = port;
     params.username = user;
     params.password = pass;
-    params.remote_dir = str8_lit(".");
+    params.remote_dir = remote_path;
     params.out_ring = &ring;
+    params.in_ring = &in_ring;
     log_start_us = now_time_us();
     control = thread_launch(sftp_control_thread_entry, &params);
     control_joined = 0;
@@ -192,7 +197,7 @@ main(void)
           if(remote_entry_count < ArrayCount(remote_entries_buf))
           {
             FS_Entry *e = &remote_entries_buf[remote_entry_count];
-            e->name = str8_copy(arena, str8(msg.name, msg.name_size));
+            e->name = str8_copy(remote_arena, str8(msg.name, msg.name_size));
             e->is_dir = msg.is_dir;
             e->size = msg.size_bytes;
             remote_entry_count += 1;
@@ -213,6 +218,9 @@ main(void)
             qsort(remote_entries_buf, remote_entry_count, sizeof(FS_Entry), fs_entry_compare);
             remote_sorted = 1;
           }
+        }
+        if(msg.kind == SFTP_CtrlMsgKind_ThreadExit)
+        {
           thread_join(control, max_U64);
           control_joined = 1;
           break;
@@ -275,10 +283,29 @@ main(void)
     F32 remote_list_y = mid_y0 + 26.0f;
     F32 remote_list_h = Max(0.0f, mid_y1 - remote_list_y);
     B32 remote_dbl = 0;
-    ui_row_list(frame_arena, &font, col_split_x + 6.0f, remote_list_y, col_split_x - 12.0f, remote_list_h, ROW_H,
-                remote_entries_buf, remote_entry_count, &remote_row_state, &remote_dbl);
-    // (remote pane doesn't navigate yet - no on-demand subdirectory fetch
-    // path to the control thread; see CLAUDE.md)
+    S32 remote_clicked = ui_row_list(frame_arena, &font, col_split_x + 6.0f, remote_list_y, col_split_x - 12.0f, remote_list_h, ROW_H,
+                                       remote_entries_buf, remote_entry_count, &remote_row_state, &remote_dbl);
+    if(connecting && !control_joined && remote_dbl && remote_clicked >= 0 && (U64)remote_clicked < remote_entry_count)
+    {
+      FS_Entry *e = &remote_entries_buf[remote_clicked];
+      if(e->is_dir && !str8_match(e->name, str8_lit(".")))
+      {
+        String8 new_path = str8_match(e->name, str8_lit(".."))
+                          ? sftp_path_parent(frame_arena, remote_path)
+                          : sftp_path_join(frame_arena, remote_path, e->name);
+        arena_clear(remote_arena);
+        remote_path = str8_copy(remote_arena, new_path);
+        remote_entry_count = 0;
+        remote_sorted = 0;
+        remote_row_state.last_click_index = -1;
+
+        SFTP_Req req = {0};
+        req.kind = SFTP_ReqKind_ListDir;
+        req.path_size = Min(remote_path.size, sizeof(req.path));
+        MemoryCopy(req.path, remote_path.str, req.path_size);
+        guarded_ring_write_struct_or_wait(&in_ring, &req, max_U64);
+      }
+    }
 
     // --- bottom pane: tab strip + content ------------------------------------------
     S32 tab_clicked = ui_tab_strip(&font, 0, bottom_y0 + 1.0f, win_w / 4.0f, TAB_STRIP_H, tab_labels, 4, bottom_tab);
@@ -343,6 +370,22 @@ main(void)
 
   if(connecting && !control_joined)
   {
+    // The control thread is (most likely) blocked waiting for the next
+    // SFTP_Req - without this it would never see ThreadExit and
+    // thread_join below would hang forever on window close.
+    SFTP_Req quit_req = {0};
+    quit_req.kind = SFTP_ReqKind_Quit;
+    guarded_ring_write_struct_or_wait(&in_ring, &quit_req, max_U64);
+
+    for(;;)
+    {
+      SFTP_CtrlMsg msg = {0};
+      guarded_ring_read_struct_or_wait(&ring, &msg, max_U64);
+      if(msg.kind == SFTP_CtrlMsgKind_ThreadExit)
+      {
+        break;
+      }
+    }
     thread_join(control, max_U64);
   }
   if(connecting)
