@@ -212,6 +212,36 @@ add a *view* onto an already-working, already-concurrent engine.
    port the console's data model to the GUI.
 6. **Polish** — site manager/bookmarks, config persistence, drag-drop, etc.
 
+### Status
+
+Phases 1-2 and the connect+listing slice of phase 3 are done. Phase 5's
+foundation is also done: `src/wm/` (window + event pump), `src/render/`
+(D3D11, one instanced-rect pipeline), `src/font/` (`fp_dwrite`/`fnt_cache` -
+DirectWrite whole-run shaping, per-glyph atlas cache), `src/draw/`
+(`dr_rect`/`dr_text`) — all namespaced `WM_`/`R_`/`FP_`/`FNT_`/`DR_` per the
+convention above. `main.c` now runs that GUI loop (not a console loop):
+it launches the same unchanged `sftp_control_thread_entry`, drains its
+`GuardedRing` non-blockingly once per frame, and renders the connect log +
+directory listing as plain text lines in the window - confirmed working
+end-to-end against a real server.
+
+One real deviation worth knowing about: `<dwrite.h>` cannot be included
+from C at all (`DWRITE_MAKE_OPENTYPE_TAG` unconditionally uses
+`static_cast`, even inside an otherwise-C-visible enum - an actual bug in
+that SDK header). So `src/font/fp_dwrite.cpp` is a small separate C++
+translation unit, compiled and linked as its own step in `build.bat` (not
+part of the `main.c` unity build), exposed back to the rest of the
+plain-C codebase via an `extern "C"` header (`fp_dwrite.h`) with an opaque
+`void*` in place of `IDWriteFontFace*`. Everything else is still one
+unity build.
+
+Still outstanding from phase 3/4: actual upload/download (the
+per-transfer-thread side of the architecture) - so far only the
+control-connection thread and a read-only directory listing exist, both
+now proven in both the console and the GUI. No `UI_` widget-tree layer
+yet either (no interactivity - can't click into a directory) - add it
+when a feature actually needs it, per the DOD philosophy above.
+
 ## Style notes
 
 - Types: `PascalCase` for structs/enums/typedefs, `snake_case` for functions

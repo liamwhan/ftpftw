@@ -88,6 +88,7 @@ set libssh2_dir=..\third_party\libssh2
 set libssh2_flags=-I%libssh2_dir%\include -I%libssh2_dir%\src -DLIBSSH2_WINCNG
 set libssh2_sources=agent bcrypt_pbkdf blowfish chacha channel cipher-chachapoly comp crypt global hostkey keepalive kex knownhost mac misc packet pem poly1305 publickey scp session sftp transport userauth userauth_kbd_packet version wincng
 set libssh2_libs=libssh2.lib crypt32.lib bcrypt.lib ws2_32.lib
+set gui_libs=d3d11.lib dxgi.lib d3dcompiler.lib dwrite.lib user32.lib
 
 pushd build
 if not exist libssh2.lib (
@@ -100,9 +101,18 @@ if not exist libssh2.lib (
 popd
 
 :: --- Build --------------------------------------------------------------------
+::
+:: fp_dwrite.cpp is compiled separately (as C++) and linked in as an extra
+:: object - <dwrite.h> can't be included from our usual plain-C unity
+:: build (see fp_dwrite.h). Not cached like libssh2.lib - it's our own
+:: source, so it always recompiles along with main.c.
 pushd build
+echo [building font shim (DirectWrite, C++)]
+%compile% %only_compile% ..\src\font\fp_dwrite.cpp %obj_out%fp_dwrite.obj
+if %errorlevel% neq 0 (popd & exit /b 1)
+
 echo [building lwftpclient]
-%compile% -I%libssh2_dir%\include ..\src\main.c %compile_link% %libssh2_libs% %out%lwftpclient.exe
+%compile% -I%libssh2_dir%\include ..\src\main.c fp_dwrite.obj %compile_link% %libssh2_libs% %gui_libs% %out%lwftpclient.exe
 if %errorlevel% neq 0 (popd & exit /b 1)
 popd
 
