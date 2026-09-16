@@ -71,6 +71,36 @@ line_from_ctrl_msg(Arena *arena, SFTP_CtrlMsg *msg, U64 log_start_us)
   return result;
 }
 
+// Allocates a fresh session arena and launches a new control-connection
+// thread against it - used both at startup and on every reconnect. The
+// GuardedRings and SFTP_ConnectParams must stay valid for the whole life
+// of the thread (it reads params->out_ring/in_ring throughout, not just at
+// startup), so they're pushed from session_arena rather than being stack
+// locals in this short-lived function - session_arena itself is only
+// released after the thread has fully exited (ThreadExit/Disconnected).
+internal Thread
+start_sftp_session(Arena *session_arena, String8 host, U16 port, String8 user, String8 pass,
+                    String8 remote_dir, GuardedRing **out_ring, GuardedRing **out_in_ring)
+{
+  GuardedRing *ring = push_array(session_arena, GuardedRing, 1);
+  *ring = guarded_ring_alloc(session_arena, KB(64));
+  GuardedRing *in_ring = push_array(session_arena, GuardedRing, 1);
+  *in_ring = guarded_ring_alloc(session_arena, KB(4));
+
+  SFTP_ConnectParams *params = push_array(session_arena, SFTP_ConnectParams, 1);
+  params->host = host;
+  params->port = port;
+  params->username = user;
+  params->password = pass;
+  params->remote_dir = remote_dir;
+  params->out_ring = ring;
+  params->in_ring = in_ring;
+
+  *out_ring = ring;
+  *out_in_ring = in_ring;
+  return thread_launch(sftp_control_thread_entry, params);
+}
+
 int
 main(void)
 {
@@ -133,26 +163,24 @@ main(void)
   F32 log_scroll_from_top = 0.0f;
   B32 log_auto_follow = 1;
 
-  GuardedRing ring = {0};
-  GuardedRing in_ring = {0};
-  SFTP_ConnectParams params = {0};
+  // Session-lifetime arena: backs the GuardedRing pair and SFTP_ConnectParams
+  // for exactly one connection attempt. Torn down and recreated on every
+  // reconnect - unlike `arena` (credentials, log history) and `remote_arena`
+  // (the currently-displayed listing), which survive reconnects.
+  Arena *session_arena = 0;
+  GuardedRing *ring = 0;
+  GuardedRing *in_ring = 0;
   Thread control = {0};
   B32 control_joined = 1;
   U64 log_start_us = 0;
+  B32 awaiting_reconnect = 0;
+  U64 reconnect_at_us = 0;
   if(connecting)
   {
     libssh2_init(0);
-    ring = guarded_ring_alloc(arena, KB(64));
-    in_ring = guarded_ring_alloc(arena, KB(4));
-    params.host = host;
-    params.port = port;
-    params.username = user;
-    params.password = pass;
-    params.remote_dir = remote_path;
-    params.out_ring = &ring;
-    params.in_ring = &in_ring;
     log_start_us = now_time_us();
-    control = thread_launch(sftp_control_thread_entry, &params);
+    session_arena = arena_alloc();
+    control = start_sftp_session(session_arena, host, port, user, pass, remote_path, &ring, &in_ring);
     control_joined = 0;
   }
 
@@ -188,7 +216,7 @@ main(void)
       for(;;)
       {
         SFTP_CtrlMsg msg = {0};
-        if(!guarded_ring_read_struct_or_wait(&ring, &msg, now_time_us()))
+        if(!guarded_ring_read_struct_or_wait(ring, &msg, now_time_us()))
         {
           break;
         }
@@ -221,11 +249,42 @@ main(void)
         }
         if(msg.kind == SFTP_CtrlMsgKind_ThreadExit)
         {
+          // Deliberate Quit (only sent on window close today) or bad
+          // credentials - either way, don't reconnect.
           thread_join(control, max_U64);
           control_joined = 1;
           break;
         }
+        if(msg.kind == SFTP_CtrlMsgKind_Disconnected)
+        {
+          thread_join(control, max_U64);
+          control_joined = 1;
+          guarded_ring_release(ring);
+          guarded_ring_release(in_ring);
+          arena_release(session_arena);
+          session_arena = 0;
+          ring = 0;
+          in_ring = 0;
+          arena_clear(remote_arena);
+          remote_entry_count = 0;
+          remote_sorted = 0;
+          remote_row_state.last_click_index = -1;
+          awaiting_reconnect = 1;
+          reconnect_at_us = now_time_us() + 2 * 1000000;
+          str8_list_push(arena, &lines, str8_lit("reconnecting in 2s..."));
+          break;
+        }
       }
+    }
+
+    // A reconnect never fires the instant it's scheduled - a short delay
+    // avoids hammering an unreachable server in a tight fail loop.
+    if(connecting && awaiting_reconnect && now_time_us() >= reconnect_at_us)
+    {
+      session_arena = arena_alloc();
+      control = start_sftp_session(session_arena, host, port, user, pass, remote_path, &ring, &in_ring);
+      control_joined = 0;
+      awaiting_reconnect = 0;
     }
 
     // --- layout ---------------------------------------------------------------
@@ -303,7 +362,7 @@ main(void)
         req.kind = SFTP_ReqKind_ListDir;
         req.path_size = Min(remote_path.size, sizeof(req.path));
         MemoryCopy(req.path, remote_path.str, req.path_size);
-        guarded_ring_write_struct_or_wait(&in_ring, &req, max_U64);
+        guarded_ring_write_struct_or_wait(in_ring, &req, max_U64);
       }
     }
 
@@ -372,22 +431,28 @@ main(void)
   {
     // The control thread is (most likely) blocked waiting for the next
     // SFTP_Req - without this it would never see ThreadExit and
-    // thread_join below would hang forever on window close.
+    // thread_join below would hang forever on window close. It could also
+    // have already died on its own (Disconnected) in the same frame we
+    // decided to quit, before we drained that message - either exit kind
+    // means the thread is gone, so accept both here.
     SFTP_Req quit_req = {0};
     quit_req.kind = SFTP_ReqKind_Quit;
-    guarded_ring_write_struct_or_wait(&in_ring, &quit_req, max_U64);
+    guarded_ring_write_struct_or_wait(in_ring, &quit_req, max_U64);
 
     for(;;)
     {
       SFTP_CtrlMsg msg = {0};
-      guarded_ring_read_struct_or_wait(&ring, &msg, max_U64);
-      if(msg.kind == SFTP_CtrlMsgKind_ThreadExit)
+      guarded_ring_read_struct_or_wait(ring, &msg, max_U64);
+      if(msg.kind == SFTP_CtrlMsgKind_ThreadExit || msg.kind == SFTP_CtrlMsgKind_Disconnected)
       {
         break;
       }
     }
     thread_join(control, max_U64);
   }
+  // else: either never connected, or currently sitting in the
+  // awaiting_reconnect gap between sessions - no live thread either way,
+  // nothing to signal or join.
   if(connecting)
   {
     libssh2_exit();

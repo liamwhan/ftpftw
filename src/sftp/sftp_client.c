@@ -33,17 +33,42 @@ sftp_send_error(GuardedRing *ring, char *fmt, ...)
   va_end(args);
 }
 
-// One listing operation: open `path`, stream its entries as Entry
-// messages, close, and send the terminal Done for this listing. Used both
-// for the initial connect-time listing and every subsequent on-demand one.
-internal void
-sftp_do_list(GuardedRing *ring, LIBSSH2_SFTP *sftp, char *path_cstr)
+// A failure from an SFTP call is either the server legitimately saying no
+// (bad path, permissions - LIBSSH2_ERROR_SFTP_PROTOCOL, session is fine)
+// or the connection itself being dead (anything else - socket/transport
+// level). Only the latter should trigger a reconnect.
+internal B32
+sftp_is_disconnect_errno(int errnum)
 {
+  return errnum != LIBSSH2_ERROR_NONE && errnum != LIBSSH2_ERROR_SFTP_PROTOCOL;
+}
+
+// One listing operation: open `path`, stream its entries as Entry
+// messages, close, and send the terminal Done for this listing - unless
+// the connection turns out to be dead, in which case no Done is sent
+// (misleading to claim an operation "completed" right before the whole
+// session drops) and this returns 1 so the caller reconnects instead of
+// looping for the next request. Used both for the initial connect-time
+// listing and every subsequent on-demand one.
+internal B32
+sftp_do_list(GuardedRing *ring, LIBSSH2_SESSION *session, LIBSSH2_SFTP *sftp, char *path_cstr)
+{
+  B32 disconnected = 0;
+
   sftp_log(ring, "opening directory '%s'", path_cstr);
   LIBSSH2_SFTP_HANDLE *dir = libssh2_sftp_opendir(sftp, path_cstr);
   if(dir == 0)
   {
-    sftp_send_error(ring, "could not open remote directory '%s'", path_cstr);
+    int errnum = libssh2_session_last_errno(session);
+    if(sftp_is_disconnect_errno(errnum))
+    {
+      disconnected = 1;
+      sftp_log(ring, "connection lost while opening '%s' (libssh2 error %d)", path_cstr, errnum);
+    }
+    else
+    {
+      sftp_send_error(ring, "could not open remote directory '%s'", path_cstr);
+    }
   }
   else
   {
@@ -53,8 +78,18 @@ sftp_do_list(GuardedRing *ring, LIBSSH2_SFTP *sftp, char *path_cstr)
       U8 name_buf[SFTP_NAME_MAX];
       LIBSSH2_SFTP_ATTRIBUTES attrs = {0};
       int rc = libssh2_sftp_readdir(dir, (char *)name_buf, sizeof(name_buf), &attrs);
-      if(rc <= 0)
+      if(rc == 0)
       {
+        break;
+      }
+      if(rc < 0)
+      {
+        int errnum = libssh2_session_last_errno(session);
+        if(sftp_is_disconnect_errno(errnum))
+        {
+          disconnected = 1;
+          sftp_log(ring, "connection lost while listing '%s' (libssh2 error %d)", path_cstr, errnum);
+        }
         break;
       }
       SFTP_CtrlMsg msg = {0};
@@ -73,12 +108,19 @@ sftp_do_list(GuardedRing *ring, LIBSSH2_SFTP *sftp, char *path_cstr)
       entry_count += 1;
     }
     libssh2_sftp_closedir(dir);
-    sftp_log(ring, "directory listing complete (%llu entries)", entry_count);
+    if(!disconnected)
+    {
+      sftp_log(ring, "directory listing complete (%llu entries)", entry_count);
+    }
   }
 
-  SFTP_CtrlMsg done_msg = {0};
-  done_msg.kind = SFTP_CtrlMsgKind_Done;
-  guarded_ring_write_struct_or_wait(ring, &done_msg, max_U64);
+  if(!disconnected)
+  {
+    SFTP_CtrlMsg done_msg = {0};
+    done_msg.kind = SFTP_CtrlMsgKind_Done;
+    guarded_ring_write_struct_or_wait(ring, &done_msg, max_U64);
+  }
+  return disconnected;
 }
 
 internal void
@@ -98,11 +140,19 @@ sftp_control_thread_entry(void *ptr)
   U64 sock = 0;
   LIBSSH2_SESSION *session = 0;
   LIBSSH2_SFTP *sftp = 0;
+  // Whether this thread is exiting because the connection died (caller
+  // should reconnect) vs. a deliberate Quit or bad credentials (caller
+  // should not). Everything before a successful auth is treated as
+  // retryable (could be a transient network/DNS blip); only bad
+  // credentials specifically is not, since retrying with the same
+  // password will never succeed.
+  B32 lost_connection = 0;
 
   sftp_log(ring, "connecting to %s:%u", host_cstr, (U32)params->port);
   if(!net_tcp_connect(params->host, params->port, &sock))
   {
     sftp_send_error(ring, "could not connect to %s:%u", host_cstr, (U32)params->port);
+    lost_connection = 1;
     goto done;
   }
   sftp_log(ring, "connected");
@@ -112,6 +162,7 @@ sftp_control_thread_entry(void *ptr)
   {
     sftp_send_error(ring, "libssh2_session_init failed");
     net_close(sock);
+    lost_connection = 1;
     goto done;
   }
   libssh2_session_set_blocking(session, 1);
@@ -125,6 +176,7 @@ sftp_control_thread_entry(void *ptr)
     sftp_send_error(ring, "SSH handshake failed: %.*s", errmsg_len, errmsg);
     libssh2_session_free(session);
     net_close(sock);
+    lost_connection = 1;
     goto done;
   }
   sftp_log(ring, "SSH handshake complete");
@@ -139,6 +191,7 @@ sftp_control_thread_entry(void *ptr)
     libssh2_session_disconnect(session, "auth failed");
     libssh2_session_free(session);
     net_close(sock);
+    // lost_connection stays 0 - bad credentials, not worth retrying.
     goto done;
   }
   sftp_log(ring, "authenticated");
@@ -151,13 +204,18 @@ sftp_control_thread_entry(void *ptr)
     libssh2_session_disconnect(session, "sftp init failed");
     libssh2_session_free(session);
     net_close(sock);
+    lost_connection = 1;
     goto done;
   }
 
-  sftp_do_list(ring, sftp, dir_cstr);
+  if(sftp_do_list(ring, session, sftp, dir_cstr))
+  {
+    lost_connection = 1;
+    goto cleanup;
+  }
 
   // Stay connected and service on-demand listing requests (remote pane
-  // navigation) until asked to quit.
+  // navigation) until asked to quit or the connection dies mid-request.
   for(;;)
   {
     SFTP_Req req = {0};
@@ -171,11 +229,17 @@ sftp_control_thread_entry(void *ptr)
       Temp req_scratch = scratch_begin(0, 0);
       String8 path = str8(req.path, Min(req.path_size, sizeof(req.path)));
       char *path_cstr = str8_to_cstring(req_scratch.arena, path);
-      sftp_do_list(ring, sftp, path_cstr);
+      B32 disc = sftp_do_list(ring, session, sftp, path_cstr);
       scratch_end(req_scratch);
+      if(disc)
+      {
+        lost_connection = 1;
+        break;
+      }
     }
   }
 
+  cleanup:;
   sftp_log(ring, "closing connection");
   libssh2_sftp_shutdown(sftp);
   libssh2_session_disconnect(session, "done");
@@ -185,7 +249,7 @@ sftp_control_thread_entry(void *ptr)
   done:;
   scratch_end(scratch);
   SFTP_CtrlMsg exit_msg = {0};
-  exit_msg.kind = SFTP_CtrlMsgKind_ThreadExit;
+  exit_msg.kind = lost_connection ? SFTP_CtrlMsgKind_Disconnected : SFTP_CtrlMsgKind_ThreadExit;
   guarded_ring_write_struct_or_wait(ring, &exit_msg, max_U64);
 }
 

@@ -24,9 +24,12 @@ typedef enum SFTP_CtrlMsgKind
 {
   SFTP_CtrlMsgKind_Log,       // one operation/command being performed - text
   SFTP_CtrlMsgKind_Entry,     // one directory entry
-  SFTP_CtrlMsgKind_Error,     // connect/auth/protocol failure - text
+  SFTP_CtrlMsgKind_Error,     // a normal SFTP-protocol-level failure (bad path, permissions, ...) - text. Session is still fine.
   SFTP_CtrlMsgKind_Done,      // the current listing's entries are all sent (thread keeps running)
-  SFTP_CtrlMsgKind_ThreadExit, // thread is actually about to return - join it now
+  SFTP_CtrlMsgKind_ThreadExit,   // thread is returning because it was asked to (Quit) or hit an
+                                 // unretryable failure (bad credentials) - join it, do NOT reconnect.
+  SFTP_CtrlMsgKind_Disconnected, // thread is returning because the connection itself died (any
+                                 // transport-level failure, at any point) - join it, then reconnect.
 }
 SFTP_CtrlMsgKind;
 
@@ -76,10 +79,14 @@ struct SFTP_ConnectParams
 
 // Entry point for thread_launch. Connects, authenticates, lists
 // remote_dir, then services SFTP_Req requests from in_ring (each producing
-// another listing) until asked to quit, at which point it disconnects and
-// sends exactly one SFTP_CtrlMsgKind_ThreadExit before returning. Every
-// listing (the initial one and each subsequent one) ends with exactly one
-// SFTP_CtrlMsgKind_Done.
+// another listing) until asked to quit or the connection dies. Ends with
+// exactly one of SFTP_CtrlMsgKind_ThreadExit (deliberate Quit, or bad
+// credentials - caller should not reconnect) or
+// SFTP_CtrlMsgKind_Disconnected (any transport-level failure, whether
+// during initial connect or later - caller should reconnect, using the
+// same credentials and whatever remote directory it was last showing).
+// Every listing (the initial one and each subsequent one) that doesn't
+// itself trip a disconnect ends with exactly one SFTP_CtrlMsgKind_Done.
 //
 // Known limitation, accepted: requests are only checked for *between*
 // listings, not mid-listing - fine given how fast a listing is, so no
