@@ -27,6 +27,13 @@ struct FNT_Piece
 internal void      fnt_init(void);
 internal R_Tex2D  *fnt_atlas(void);
 
+// Packs an arbitrary caller-supplied alpha bitmap (e.g. a procedurally
+// drawn icon) into the same shared atlas/shelf-packer glyphs use, so
+// icon-textured quads and glyph-textured quads still batch into one draw
+// call. `pixels` is `h` rows of `w` bytes (one byte per pixel, alpha).
+internal void fnt_atlas_pack_bitmap(U8 *pixels, U32 w, U32 h,
+                                     F32 *out_u0, F32 *out_v0, F32 *out_u1, F32 *out_v1);
+
 // Shapes `string` (via FP_, so kerning is correct) and fills `out_pieces`
 // (capacity `max_pieces`) with one piece per visible glyph, positioned
 // starting at (pos_x, pos_y). Returns the piece count; *out_advance gets

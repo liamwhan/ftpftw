@@ -50,6 +50,45 @@ fnt_glyph_find(void *face, F32 size_px, U32 glyph_id)
   return result;
 }
 
+// Shared shelf/row packer: used both for glyphs (below) and for arbitrary
+// bitmaps (fnt_atlas_pack_bitmap, e.g. procedurally-drawn UI icons) so both
+// kinds of quad sample the same atlas texture and still batch into one
+// draw call.
+internal void
+fnt__atlas_pack(U32 width, U32 height, U8 *pixels, U32 pixels_pitch,
+                F32 *out_u0, F32 *out_v0, F32 *out_u1, F32 *out_v1)
+{
+  // 1px gutter around each packed rect so linear sampling never bleeds
+  // into a neighboring rect's texels.
+  U32 packed_w = width + 1;
+  U32 packed_h = height + 1;
+  if(fnt_g.shelf_x + packed_w > FNT_ATLAS_SIZE)
+  {
+    fnt_g.shelf_x = 0;
+    fnt_g.shelf_y += fnt_g.shelf_h;
+    fnt_g.shelf_h = 0;
+  }
+  AssertAlways(fnt_g.shelf_y + packed_h <= FNT_ATLAS_SIZE); // atlas out of room
+
+  U32 px = fnt_g.shelf_x;
+  U32 py = fnt_g.shelf_y;
+  r_tex2d_fill_region(&fnt_g.atlas, px, py, width, height, pixels, pixels_pitch);
+
+  *out_u0 = (F32)px / (F32)FNT_ATLAS_SIZE;
+  *out_v0 = (F32)py / (F32)FNT_ATLAS_SIZE;
+  *out_u1 = (F32)(px + width) / (F32)FNT_ATLAS_SIZE;
+  *out_v1 = (F32)(py + height) / (F32)FNT_ATLAS_SIZE;
+
+  fnt_g.shelf_x += packed_w;
+  fnt_g.shelf_h = Max(fnt_g.shelf_h, packed_h);
+}
+
+internal void
+fnt_atlas_pack_bitmap(U8 *pixels, U32 w, U32 h, F32 *out_u0, F32 *out_v0, F32 *out_u1, F32 *out_v1)
+{
+  fnt__atlas_pack(w, h, pixels, w, out_u0, out_v0, out_u1, out_v1);
+}
+
 internal FNT_GlyphEntry *
 fnt_glyph_insert(FP_Font *font, F32 size_px, U32 glyph_id)
 {
@@ -74,29 +113,7 @@ fnt_glyph_insert(FP_Font *font, F32 size_px, U32 glyph_id)
 
     if(has_ink && width > 0 && height > 0)
     {
-      // 1px gutter around each glyph so linear sampling never bleeds
-      // into a neighboring glyph's texels.
-      U32 packed_w = width + 1;
-      U32 packed_h = height + 1;
-      if(fnt_g.shelf_x + packed_w > FNT_ATLAS_SIZE)
-      {
-        fnt_g.shelf_x = 0;
-        fnt_g.shelf_y += fnt_g.shelf_h;
-        fnt_g.shelf_h = 0;
-      }
-      AssertAlways(fnt_g.shelf_y + packed_h <= FNT_ATLAS_SIZE); // atlas out of room
-
-      U32 px = fnt_g.shelf_x;
-      U32 py = fnt_g.shelf_y;
-      r_tex2d_fill_region(&fnt_g.atlas, px, py, width, height, pixel_buf, width);
-
-      e->u0 = (F32)px / (F32)FNT_ATLAS_SIZE;
-      e->v0 = (F32)py / (F32)FNT_ATLAS_SIZE;
-      e->u1 = (F32)(px + width) / (F32)FNT_ATLAS_SIZE;
-      e->v1 = (F32)(py + height) / (F32)FNT_ATLAS_SIZE;
-
-      fnt_g.shelf_x += packed_w;
-      fnt_g.shelf_h = Max(fnt_g.shelf_h, packed_h);
+      fnt__atlas_pack(width, height, pixel_buf, width, &e->u0, &e->v0, &e->u1, &e->v1);
     }
   }
 

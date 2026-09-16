@@ -49,4 +49,15 @@ internal void     *wm_native_handle(WM_Window window); // HWND, for the renderer
 // close/resize events arrived since the last call, allocated into `arena`.
 internal WM_EventList wm_get_events(Arena *arena);
 
+// Polled (not event-queued) cursor position (client-area pixels) and left
+// button down-state, fed by the same WndProc as the events above. Call
+// once per frame - fits the immediate-mode convention of asking "what is
+// the mouse doing right now" rather than routing clicks through events.
+internal void wm_mouse_state(WM_Window window, F32 *out_x, F32 *out_y, B32 *out_left_down);
+
+// Accumulated wheel notches (positive = away from user / "scroll up")
+// since the last call - reads-and-resets, same polled-once-per-frame
+// convention as wm_mouse_state.
+internal F32 wm_mouse_wheel_delta(void);
+
 #endif // WM_CORE_H

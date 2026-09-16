@@ -40,6 +40,7 @@ struct R_RectInst
   F32 src_x0, src_y0, src_x1, src_y1; // atlas UV rect, [0,1]
   F32 color_r, color_g, color_b, color_a;
   F32 is_textured;
+  F32 clip_x0, clip_y0, clip_x1, clip_y1; // pixel-space clip rect - pixels outside are discarded
 };
 
 internal void r_init(void);

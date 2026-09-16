@@ -48,12 +48,14 @@ global char *r_g_vs_src =
 "  float4 src_rect : SRC_RECT;\n"
 "  float4 color : COLOR;\n"
 "  float is_textured : TEXTURED;\n"
+"  float4 clip_rect : CLIP_RECT;\n"
 "};\n"
 "struct VS_OUTPUT {\n"
 "  float4 pos : SV_Position;\n"
 "  float2 uv : TEXCOORD0;\n"
 "  float4 color : COLOR0;\n"
 "  float is_textured : TEXTURED0;\n"
+"  float4 clip_rect : CLIP_RECT0;\n"
 "};\n"
 "VS_OUTPUT vs_main(VS_INPUT input) {\n"
 "  float2 pixel_pos = lerp(input.dst_rect.xy, input.dst_rect.zw, input.unit_pos);\n"
@@ -63,6 +65,7 @@ global char *r_g_vs_src =
 "  o.uv = lerp(input.src_rect.xy, input.src_rect.zw, input.unit_pos);\n"
 "  o.color = input.color;\n"
 "  o.is_textured = input.is_textured;\n"
+"  o.clip_rect = input.clip_rect;\n"
 "  return o;\n"
 "}\n";
 
@@ -74,8 +77,13 @@ global char *r_g_ps_src =
 "  float2 uv : TEXCOORD0;\n"
 "  float4 color : COLOR0;\n"
 "  float is_textured : TEXTURED0;\n"
+"  float4 clip_rect : CLIP_RECT0;\n"
 "};\n"
 "float4 ps_main(VS_OUTPUT input) : SV_Target {\n"
+"  if(input.pos.x < input.clip_rect.x || input.pos.x > input.clip_rect.z ||\n"
+"     input.pos.y < input.clip_rect.y || input.pos.y > input.clip_rect.w) {\n"
+"    discard;\n"
+"  }\n"
 "  float4 color = input.color;\n"
 "  if(input.is_textured > 0.5) {\n"
 "    float a = atlas_tex.Sample(atlas_sampler, input.uv).r;\n"
@@ -152,6 +160,7 @@ r_window_equip(WM_Window window)
     {"SRC_RECT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16, D3D11_INPUT_PER_INSTANCE_DATA, 1},
     {"COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 32, D3D11_INPUT_PER_INSTANCE_DATA, 1},
     {"TEXTURED", 0, DXGI_FORMAT_R32_FLOAT,          1, 48, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+    {"CLIP_RECT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 52, D3D11_INPUT_PER_INSTANCE_DATA, 1},
   };
   hr = ID3D11Device_CreateInputLayout(r_g.device, layout, ArrayCount(layout),
                                        ID3D10Blob_GetBufferPointer(vs_blob),
@@ -338,3 +347,4 @@ r_tex2d_release(R_Tex2D *tex)
   ID3D11Texture2D_Release(tex->texture);
   MemoryZeroStruct(tex);
 }
+

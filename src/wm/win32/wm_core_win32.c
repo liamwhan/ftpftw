@@ -7,6 +7,11 @@ global HWND    wm_g_hwnd = 0;
 global WM_Event wm_g_raw_events[64];
 global U64      wm_g_raw_event_count;
 
+global F32 wm_g_mouse_x = 0.0f;
+global F32 wm_g_mouse_y = 0.0f;
+global B32 wm_g_mouse_left_down = 0;
+global F32 wm_g_wheel_delta = 0.0f;
+
 internal LRESULT CALLBACK
 wm_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
@@ -42,6 +47,32 @@ wm_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
         wm_g_raw_events[wm_g_raw_event_count].height = HIWORD(lparam);
         wm_g_raw_event_count += 1;
       }
+    }break;
+
+    case WM_MOUSEMOVE:
+    {
+      // cast through S16 first: client coords can go negative while
+      // dragging with the mouse captured outside the window
+      wm_g_mouse_x = (F32)(S16)LOWORD(lparam);
+      wm_g_mouse_y = (F32)(S16)HIWORD(lparam);
+    }break;
+
+    case WM_LBUTTONDOWN:
+    {
+      wm_g_mouse_left_down = 1;
+      SetCapture(hwnd); // keep tracking button-up/move even if dragged outside the window
+    }break;
+
+    case WM_LBUTTONUP:
+    {
+      wm_g_mouse_left_down = 0;
+      ReleaseCapture();
+    }break;
+
+    case WM_MOUSEWHEEL:
+    {
+      S16 delta_raw = (S16)HIWORD(wparam);
+      wm_g_wheel_delta += (F32)delta_raw / (F32)WHEEL_DELTA;
     }break;
   }
   return result;
@@ -113,6 +144,23 @@ internal void *
 wm_native_handle(WM_Window window)
 {
   return PtrFromInt(window.u64[0]);
+}
+
+internal void
+wm_mouse_state(WM_Window window, F32 *out_x, F32 *out_y, B32 *out_left_down)
+{
+  (void)window; // single-window app - state is process-global for now
+  *out_x = wm_g_mouse_x;
+  *out_y = wm_g_mouse_y;
+  *out_left_down = wm_g_mouse_left_down;
+}
+
+internal F32
+wm_mouse_wheel_delta(void)
+{
+  F32 result = wm_g_wheel_delta;
+  wm_g_wheel_delta = 0.0f;
+  return result;
 }
 
 internal WM_EventList
