@@ -20,6 +20,7 @@ enum
   WM_EventKind_Resize,
   WM_EventKind_Char,    // a typed character - code is the codepoint (BMP/ASCII)
   WM_EventKind_KeyDown, // a non-character key - code is the VK_* virtual-key code
+  WM_EventKind_Paste,   // Ctrl+V - no payload; call wm_clipboard_get_text to read it
 };
 
 typedef struct WM_Event WM_Event;
@@ -62,5 +63,12 @@ internal void wm_mouse_state(WM_Window window, F32 *out_x, F32 *out_y, B32 *out_
 // since the last call - reads-and-resets, same polled-once-per-frame
 // convention as wm_mouse_state.
 internal F32 wm_mouse_wheel_delta(void);
+
+// Reads the system clipboard's text (if any) into a caller-owned fixed
+// buffer, converted to UTF-8 - no arena needed, matching UI_TextEditState's
+// own fixed-capacity-buffer style. Returns the byte length actually
+// written (0 if the clipboard has no text, truncated to out_buf_cap if
+// longer). Called from ui_text_edit in response to WM_EventKind_Paste.
+internal U64 wm_clipboard_get_text(U8 *out_buf, U64 out_buf_cap);
 
 #endif // WM_CORE_H

@@ -91,7 +91,19 @@ wm_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 
     case WM_KEYDOWN:
     {
-      if(wm_g_raw_event_count < ArrayCount(wm_g_raw_events))
+      // Ctrl+V is reported as its own event kind rather than a plain 'V'
+      // KeyDown - clipboard access is the concern of whoever handles
+      // Paste (ui_text_edit), not something every KeyDown consumer should
+      // have to separately check ctrl-state for.
+      if(wparam == 'V' && (GetKeyState(VK_CONTROL) & 0x8000))
+      {
+        if(wm_g_raw_event_count < ArrayCount(wm_g_raw_events))
+        {
+          wm_g_raw_events[wm_g_raw_event_count].kind = WM_EventKind_Paste;
+          wm_g_raw_event_count += 1;
+        }
+      }
+      else if(wm_g_raw_event_count < ArrayCount(wm_g_raw_events))
       {
         wm_g_raw_events[wm_g_raw_event_count].kind = WM_EventKind_KeyDown;
         wm_g_raw_events[wm_g_raw_event_count].code = (U32)wparam;
@@ -184,6 +196,38 @@ wm_mouse_wheel_delta(void)
 {
   F32 result = wm_g_wheel_delta;
   wm_g_wheel_delta = 0.0f;
+  return result;
+}
+
+internal U64
+wm_clipboard_get_text(U8 *out_buf, U64 out_buf_cap)
+{
+  U64 result = 0;
+  if(OpenClipboard(wm_g_hwnd))
+  {
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if(h != 0)
+    {
+      WCHAR *wide = (WCHAR *)GlobalLock(h);
+      if(wide != 0)
+      {
+        // Clamp the wide length before converting rather than after -
+        // WideCharToMultiByte fails outright (rather than truncating) if
+        // the destination is too small for the requested wide-char count,
+        // and no real credential field needs more than this anyway.
+        int wide_len = Min((int)wcslen(wide), 1024);
+        char temp[4096];
+        int utf8_len = WideCharToMultiByte(CP_UTF8, 0, wide, wide_len, temp, (int)sizeof(temp), 0, 0);
+        if(utf8_len > 0)
+        {
+          result = Min((U64)utf8_len, out_buf_cap);
+          MemoryCopy(out_buf, temp, result);
+        }
+        GlobalUnlock(h);
+      }
+    }
+    CloseClipboard();
+  }
   return result;
 }
 

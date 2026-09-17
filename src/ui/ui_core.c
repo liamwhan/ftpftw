@@ -219,6 +219,20 @@ ui_text_edit(WM_EventList *events, FP_Font *font, F32 x, F32 y, F32 w, F32 h,
           default: break;
         }
       }
+      else if(ev->kind == WM_EventKind_Paste)
+      {
+        U8 paste_buf[256];
+        U64 paste_len = wm_clipboard_get_text(paste_buf, sizeof(paste_buf));
+        U64 space = (sizeof(state->buffer) - 1) - state->len;
+        U64 insert_len = Min(paste_len, space);
+        if(insert_len > 0)
+        {
+          MemoryCopy(state->buffer + state->cursor + insert_len, state->buffer + state->cursor, state->len - state->cursor);
+          MemoryCopy(state->buffer + state->cursor, paste_buf, insert_len);
+          state->len += insert_len;
+          state->cursor += insert_len;
+        }
+      }
     }
   }
 
