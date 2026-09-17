@@ -64,6 +64,12 @@ internal void wm_mouse_state(WM_Window window, F32 *out_x, F32 *out_y, B32 *out_
 // convention as wm_mouse_state.
 internal F32 wm_mouse_wheel_delta(void);
 
+// Polled modifier-key state, same convention as wm_mouse_state - queried
+// once per frame (from ui_begin_frame) rather than tracked through events,
+// since click handlers just need "is ctrl/shift down right now" at the
+// moment a click lands.
+internal void wm_key_modifiers(B32 *out_ctrl, B32 *out_shift, B32 *out_alt);
+
 // Reads the system clipboard's text (if any) into a caller-owned fixed
 // buffer, converted to UTF-8 - no arena needed, matching UI_TextEditState's
 // own fixed-capacity-buffer style. Returns the byte length actually

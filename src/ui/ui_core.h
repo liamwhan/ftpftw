@@ -14,6 +14,7 @@ struct UI_RowListState
   S32 last_click_index;
   U64 last_click_time_us;
   F32 scroll_y; // pixels scrolled down from the top - caller-owned, persists across frames
+  S32 shift_anchor_index; // range-select anchor - set by plain/ctrl clicks, held fixed across shift-clicks
 };
 
 // A single-line text field's persistent state - one per field, caller-
@@ -64,8 +65,23 @@ internal S32 ui_tab_strip(FP_Font *font, F32 x, F32 y, F32 tab_w, F32 tab_h,
 // instance* - callers own one UI_RowListState per row-list on screen, so
 // clicking in one pane can't be mistaken for continuing a double-click in
 // another.
+//
+// `selected` is a caller-owned array of `entry_count` bools this widget
+// reads AND writes (not internal state) - plain click selects only the
+// clicked row *unless it's already selected*, in which case the existing
+// (possibly multi-row) selection is left untouched - this is what lets a
+// caller start dragging a whole multi-selection from a plain press on any
+// one of its rows, rather than the press itself collapsing the selection
+// down to one row before the drag begins. To shrink a multi-selection to
+// one item, click a row that isn't already selected. Ctrl+click toggles
+// just the clicked row regardless; Shift+click selects the contiguous
+// range from `state->shift_anchor_index` to the clicked row (replacing
+// any previous range; the anchor itself only moves on plain/Ctrl clicks).
+// Caller should size/allocate `selected` from the same arena its
+// `entries` come from, so a rebuilt listing naturally starts with a
+// fresh (zeroed) selection rather than a stale one.
 internal S32 ui_row_list(Arena *frame_arena, FP_Font *font, F32 x, F32 y, F32 width, F32 height, F32 row_h,
-                          FS_Entry *entries, U64 entry_count,
+                          FS_Entry *entries, U64 entry_count, B32 *selected,
                           UI_RowListState *state, B32 *out_double_clicked);
 
 // --- text edit state helpers -------------------------------------------------
@@ -88,5 +104,12 @@ internal B32 ui_text_edit(WM_EventList *events, FP_Font *font, F32 x, F32 y, F32
 // Hover-highlighted icon button (an atlas-packed icon, e.g. from ui_icons.h)
 // at a caller-given UV rect. Returns whether it was clicked this frame.
 internal B32 ui_icon_button(F32 x, F32 y, F32 size, F32 u0, F32 v0, F32 u1, F32 v1);
+
+// A plain hover-highlighted, centered-label button. Returns whether it was
+// clicked this frame. (ui_conn_modal.c has its own near-identical private
+// helper predating this - not worth churning that working code just to
+// converge on this one for a single-phase addition; new modals should use
+// this shared one instead of writing a third copy.)
+internal B32 ui_button(FP_Font *font, F32 x, F32 y, F32 w, F32 h, String8 label);
 
 #endif // UI_CORE_H

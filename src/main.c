@@ -34,15 +34,22 @@
 
 #include "store/conn_store.h"
 #include "store/conn_store.c"
+#include "store/xfer_settings.h"
+#include "store/xfer_settings.c"
 
 #include "ui/ui_conn_modal.h"
 #include "ui/ui_conn_modal.c"
+#include "ui/ui_settings_modal.h"
+#include "ui/ui_settings_modal.c"
 
 #include <libssh2.h>
 #include <libssh2_sftp.h>
 
 #include "sftp/sftp_client.h"
 #include "sftp/sftp_client.c"
+
+#include "xfer/xfer.h"
+#include "xfer/xfer.c"
 
 #define TOOLBAR_H     40.0f
 #define BOTTOM_PANE_H 200.0f
@@ -125,6 +132,9 @@ struct RemoteConn
   Thread control;
   B32 control_joined;
   B32 connecting;         // true once any connection attempt has ever been made - never goes back to false
+  B32 active;             // true whenever there's a live-or-should-reconnect session; false once the user
+                           // manually disconnects - lets Disconnect actually stop the auto-reconnect timer
+                           // without also having to unwind `connecting`'s (deliberately) one-way meaning
   B32 awaiting_reconnect;
   U64 reconnect_at_us;
   U64 log_start_us;
@@ -140,6 +150,7 @@ struct RemoteConn
   Arena *remote_arena;
   String8 remote_path;
   FS_Entry entries[MAX_REMOTE_ENTRIES];
+  B32 selected[MAX_REMOTE_ENTRIES];
   U64 entry_count;
   B32 sorted;
   UI_RowListState row_state;
@@ -199,7 +210,9 @@ connect_to(RemoteConn *rc, String8 host, U16 port, String8 user, String8 pass)
   rc->remote_path = str8_copy(rc->remote_arena, str8_lit("."));
   rc->entry_count = 0;
   rc->sorted = 0;
+  MemoryZeroArray(rc->selected);
   rc->row_state.last_click_index = -1;
+  rc->row_state.shift_anchor_index = -1;
   rc->row_state.scroll_y = 0.0f;
 
   rc->log_start_us = now_time_us();
@@ -208,6 +221,7 @@ connect_to(RemoteConn *rc, String8 host, U16 port, String8 user, String8 pass)
                                     &rc->ring, &rc->in_ring);
   rc->control_joined = 0;
   rc->connecting = 1;
+  rc->active = 1;
 }
 
 int
@@ -239,10 +253,17 @@ main(void)
   FS_EntryArray local_entries = fs_list_dir(local_arena, local_path);
   UI_RowListState local_row_state = {0};
   local_row_state.last_click_index = -1;
+  local_row_state.shift_anchor_index = -1;
+  B32 *local_selected = push_array(local_arena, B32, local_entries.count);
 
   // --- Connections modal ------------------------------------------------------
   UI_ConnModal conn_modal = {0};
   ui_conn_modal_init(&conn_modal, arena);
+
+  // --- Transfer settings modal --------------------------------------------------
+  XFER_Settings xfer_settings = xfer_settings_load();
+  UI_SettingsModal settings_modal = {0};
+  ui_settings_modal_init(&settings_modal);
 
   // --- remote connection + pane state ------------------------------------------
   // libssh2_init/exit bracket the whole process lifetime exactly once,
@@ -255,6 +276,7 @@ main(void)
   rc.creds_arena = arena_alloc();
   rc.remote_arena = arena_alloc();
   rc.row_state.last_click_index = -1;
+  rc.row_state.shift_anchor_index = -1;
 
   String8List lines = {0};
 
@@ -288,6 +310,20 @@ main(void)
   // user scrolls the wheel over it, same as a terminal/log viewer.
   F32 log_scroll_from_top = 0.0f;
   B32 log_auto_follow = 1;
+
+  // --- transfer queue -----------------------------------------------------------
+  Arena *xfer_arena = arena_alloc(); // never cleared - ops persist for Queue/Failed/Completed history
+  XFER_Queue xfer_queue;
+  xfer_queue_init(&xfer_queue, xfer_arena);
+
+  // Intra-app drag-and-drop between the local/remote panes (no Win32 OLE
+  // drag-drop - just our own mouse-down/move/up state machine). `active`
+  // arms on a press over a pane that already has a selection; `dragging`
+  // only becomes true past a small movement threshold, so a plain click
+  // doesn't misfire as a drag.
+  typedef struct DragState DragState;
+  struct DragState { B32 active; B32 dragging; B32 from_remote; F32 start_x, start_y; };
+  DragState drag = {0};
 
   B32 should_quit = 0;
   while(!should_quit)
@@ -372,7 +408,9 @@ main(void)
           arena_clear(rc.remote_arena);
           rc.entry_count = 0;
           rc.sorted = 0;
+          MemoryZeroArray(rc.selected);
           rc.row_state.last_click_index = -1;
+          rc.row_state.shift_anchor_index = -1;
           rc.awaiting_reconnect = 1;
           rc.reconnect_at_us = now_time_us() + 2 * 1000000;
           str8_list_push(arena, &lines, str8_lit("reconnecting in 2s..."));
@@ -385,7 +423,7 @@ main(void)
     // avoids hammering an unreachable server in a tight fail loop. Resumes
     // at the same remote_path (unlike connect_to, which always resets to
     // root) since this is the *same* target coming back, not a switch.
-    if(rc.connecting && rc.awaiting_reconnect && now_time_us() >= rc.reconnect_at_us)
+    if(rc.connecting && rc.active && rc.awaiting_reconnect && now_time_us() >= rc.reconnect_at_us)
     {
       rc.log_start_us = now_time_us();
       rc.session_arena = arena_alloc();
@@ -394,6 +432,12 @@ main(void)
       rc.control_joined = 0;
       rc.awaiting_reconnect = 0;
     }
+
+    // Non-blocking: promotes Queued ops to InProgress up to the configured
+    // caps, then drains whatever progress/completion messages any
+    // currently-InProgress op's own independent session has produced.
+    xfer_dispatch(&xfer_queue, xfer_settings.max_downloads, xfer_settings.max_uploads);
+    xfer_drain_progress(&xfer_queue);
 
     // --- layout ---------------------------------------------------------------
     U32 win_w_u, win_h_u;
@@ -407,19 +451,79 @@ main(void)
 
     dr_begin_frame(0.08f, 0.08f, 0.10f, 1.0f);
 
+    // Input gating while a modal is open: skip pane/tab/toolbar-action
+    // interaction entirely (still draw them - just dimmed by the modal's
+    // own overlay - don't act on clicks landing behind it). Declared before
+    // the toolbar below since Disconnect needs it too, not just the panes.
+    B32 input_gated = conn_modal.open || settings_modal.open;
+
     // toolbar
     dr_rect(0, 0, win_w, TOOLBAR_H, 0.16f, 0.16f, 0.18f, 1.0f);
     dr_rect(0, TOOLBAR_H, win_w, TOOLBAR_H + 1.0f, 0.05f, 0.05f, 0.06f, 1.0f);
     {
       F32 conn_u0, conn_v0, conn_u1, conn_v1;
       ui_icon_conn_uv(&conn_u0, &conn_v0, &conn_u1, &conn_v1);
-      // Input gating: while the modal is open, the toolbar button itself
-      // stays live (so Close/re-toggle still works via it if wanted) but
-      // clicking it while already open would just re-open onto itself -
-      // harmless - so no extra guard needed here specifically.
+      // Input gating: while a modal is open, the toolbar toggle buttons
+      // themselves stay live (so Close/re-toggle/switch-to-the-other-modal
+      // all still work) - only the panes/tabs and action buttons like
+      // Disconnect are blocked below.
       if(ui_icon_button(6.0f, 6.0f, TOOLBAR_H - 12.0f, conn_u0, conn_v0, conn_u1, conn_v1))
       {
         conn_modal.open = !conn_modal.open;
+        if(conn_modal.open)
+        {
+          settings_modal.open = 0;
+        }
+      }
+    }
+    {
+      F32 settings_u0, settings_v0, settings_u1, settings_v1;
+      ui_icon_settings_uv(&settings_u0, &settings_v0, &settings_u1, &settings_v1);
+      if(ui_icon_button(40.0f, 6.0f, TOOLBAR_H - 12.0f, settings_u0, settings_v0, settings_u1, settings_v1))
+      {
+        settings_modal.open = !settings_modal.open;
+        if(settings_modal.open)
+        {
+          conn_modal.open = 0;
+        }
+      }
+    }
+    if(rc.active)
+    {
+      F32 dc_x = 74.0f, dc_y = 6.0f, dc_w = 96.0f, dc_h = TOOLBAR_H - 12.0f;
+      B32 dc_hovered = ui__point_in_rect(ui_g_mouse_x, ui_g_mouse_y, dc_x, dc_y, dc_x + dc_w, dc_y + dc_h);
+      F32 dc_bg = dc_hovered ? 0.70f : 0.55f;
+      dr_rect(dc_x, dc_y, dc_x + dc_w, dc_y + dc_h, dc_bg, 0.12f, 0.12f, 1.0f);
+      String8 dc_label = str8_lit("Disconnect");
+      F32 dc_advance = 0.0f;
+      FNT_Piece dc_measure[16];
+      fnt_text_pieces(&font, 13.0f, dc_label, 0, 0, dc_measure, ArrayCount(dc_measure), &dc_advance);
+      dr_text(&font, 13.0f, dc_x + (dc_w - dc_advance) * 0.5f, ui_text_baseline_y(dc_y, dc_h, 13.0f),
+              1.0f, 1.0f, 1.0f, 1.0f, dc_label);
+      if(!input_gated && dc_hovered && ui__mouse_pressed_edge())
+      {
+        // Covers both "actually connected" and "sitting in the
+        // awaiting_reconnect gap" - teardown_live_session only makes
+        // sense (and is only safe) when a thread is actually live;
+        // the reconnect-timer path already left everything null'd
+        // otherwise, matching the shutdown path's own guard below.
+        if(!rc.control_joined)
+        {
+          teardown_live_session(&rc);
+          rc.control_joined = 1;
+          rc.session_arena = 0;
+          rc.ring = 0;
+          rc.in_ring = 0;
+        }
+        rc.awaiting_reconnect = 0;
+        rc.active = 0;
+        arena_clear(rc.remote_arena);
+        rc.entry_count = 0;
+        rc.sorted = 0;
+        MemoryZeroArray(rc.selected);
+        rc.row_state.last_click_index = -1;
+        rc.row_state.shift_anchor_index = -1;
+        str8_list_push(arena, &lines, str8_lit("disconnected"));
       }
     }
 
@@ -432,18 +536,13 @@ main(void)
     // above should ever be able to show through here regardless.
     dr_rect(0, bottom_y0 + 1.0f, win_w, win_h, 0.08f, 0.08f, 0.10f, 1.0f);
 
-    // Input gating while the modal is open: skip pane/tab interaction
-    // entirely (still draw them - just dimmed by the modal's own overlay -
-    // don't act on clicks landing behind it).
-    B32 input_gated = conn_modal.open;
-
     // --- local pane -------------------------------------------------------------
     dr_text(&font, 13.0f, 10.0f, ui_text_baseline_y(mid_y0, 26.0f, 13.0f), 0.55f, 0.55f, 0.55f, 1.0f, str8_lit("Local"));
     F32 local_list_y = mid_y0 + 26.0f;
     F32 local_list_h = Max(0.0f, mid_y1 - local_list_y);
     B32 local_dbl = 0;
     S32 local_clicked = ui_row_list(frame_arena, &font, 6.0f, local_list_y, col_split_x - 12.0f, local_list_h, ROW_H,
-                                      local_entries.v, local_entries.count, &local_row_state, &local_dbl);
+                                      local_entries.v, local_entries.count, local_selected, &local_row_state, &local_dbl);
     if(!input_gated && local_dbl && local_clicked >= 0 && (U64)local_clicked < local_entries.count)
     {
       FS_Entry *e = &local_entries.v[local_clicked];
@@ -455,12 +554,14 @@ main(void)
         arena_clear(local_arena);
         local_path = str8_copy(local_arena, new_path);
         local_entries = fs_list_dir(local_arena, local_path);
+        local_selected = push_array(local_arena, B32, local_entries.count);
         local_row_state.last_click_index = -1;
+        local_row_state.shift_anchor_index = -1;
       }
     }
 
     // --- remote pane --------------------------------------------------------------
-    if(rc.connecting)
+    if(rc.active)
     {
       dr_text(&font, 13.0f, col_split_x + 10.0f, ui_text_baseline_y(mid_y0, 26.0f, 13.0f), 0.55f, 0.55f, 0.55f, 1.0f, rc.host);
     }
@@ -468,7 +569,7 @@ main(void)
     F32 remote_list_h = Max(0.0f, mid_y1 - remote_list_y);
     B32 remote_dbl = 0;
     S32 remote_clicked = ui_row_list(frame_arena, &font, col_split_x + 6.0f, remote_list_y, col_split_x - 12.0f, remote_list_h, ROW_H,
-                                       rc.entries, rc.entry_count, &rc.row_state, &remote_dbl);
+                                       rc.entries, rc.entry_count, rc.selected, &rc.row_state, &remote_dbl);
     if(!input_gated && rc.connecting && !rc.control_joined && remote_dbl && remote_clicked >= 0 && (U64)remote_clicked < rc.entry_count)
     {
       FS_Entry *e = &rc.entries[remote_clicked];
@@ -481,13 +582,99 @@ main(void)
         rc.remote_path = str8_copy(rc.remote_arena, new_path);
         rc.entry_count = 0;
         rc.sorted = 0;
+        MemoryZeroArray(rc.selected);
         rc.row_state.last_click_index = -1;
+        rc.row_state.shift_anchor_index = -1;
 
         SFTP_Req req = {0};
         req.kind = SFTP_ReqKind_ListDir;
         req.path_size = Min(rc.remote_path.size, sizeof(req.path));
         MemoryCopy(req.path, rc.remote_path.str, req.path_size);
         guarded_ring_write_struct_or_wait(rc.in_ring, &req, max_U64);
+      }
+    }
+
+    // --- drag-and-drop between the two panes -------------------------------------
+    // Arm on a fresh press over a pane that already has a selection (rather
+    // than requiring the press to land on an already-selected *row* -
+    // whatever's currently selected in that pane is what gets dragged,
+    // matching ordinary file-manager behavior); become a real drag only
+    // past a small movement threshold so plain clicks never misfire as one;
+    // on release over the *other* pane, queue one op per selected file
+    // (directories are skipped this pass - no recursive transfer yet).
+    {
+      F32 local_px0 = 6.0f, local_py0 = local_list_y, local_px1 = local_px0 + (col_split_x - 12.0f), local_py1 = local_py0 + local_list_h;
+      F32 remote_px0 = col_split_x + 6.0f, remote_py0 = remote_list_y, remote_px1 = remote_px0 + (col_split_x - 12.0f), remote_py1 = remote_py0 + remote_list_h;
+
+      B32 mouse_pressed_now = ui_g_mouse_left_down && !ui_g_mouse_left_was_down;
+      B32 mouse_released_now = !ui_g_mouse_left_down && ui_g_mouse_left_was_down;
+
+      if(!input_gated)
+      {
+        if(mouse_pressed_now && !drag.active)
+        {
+          B32 in_local = ui__point_in_rect(ui_g_mouse_x, ui_g_mouse_y, local_px0, local_py0, local_px1, local_py1);
+          B32 in_remote = ui__point_in_rect(ui_g_mouse_x, ui_g_mouse_y, remote_px0, remote_py0, remote_px1, remote_py1);
+          B32 local_has_selection = 0;
+          for(U64 i = 0; i < local_entries.count; i += 1) { if(local_selected[i]) { local_has_selection = 1; break; } }
+          B32 remote_has_selection = 0;
+          for(U64 i = 0; i < rc.entry_count; i += 1) { if(rc.selected[i]) { remote_has_selection = 1; break; } }
+
+          if(in_local && local_has_selection)
+          {
+            drag.active = 1; drag.from_remote = 0; drag.start_x = ui_g_mouse_x; drag.start_y = ui_g_mouse_y;
+          }
+          else if(in_remote && remote_has_selection && rc.connecting && !rc.control_joined)
+          {
+            drag.active = 1; drag.from_remote = 1; drag.start_x = ui_g_mouse_x; drag.start_y = ui_g_mouse_y;
+          }
+        }
+
+        if(drag.active && !drag.dragging)
+        {
+          F32 dx = ui_g_mouse_x - drag.start_x, dy = ui_g_mouse_y - drag.start_y;
+          if(dx * dx + dy * dy > 16.0f) // ~4px movement threshold
+          {
+            drag.dragging = 1;
+          }
+        }
+
+        if(drag.active && mouse_released_now)
+        {
+          if(drag.dragging)
+          {
+            B32 drop_in_local = ui__point_in_rect(ui_g_mouse_x, ui_g_mouse_y, local_px0, local_py0, local_px1, local_py1);
+            B32 drop_in_remote = ui__point_in_rect(ui_g_mouse_x, ui_g_mouse_y, remote_px0, remote_py0, remote_px1, remote_py1);
+            if(drag.from_remote && drop_in_local)
+            {
+              for(U64 i = 0; i < rc.entry_count; i += 1)
+              {
+                if(rc.selected[i] && !rc.entries[i].is_dir)
+                {
+                  String8 remote_full = sftp_path_join(frame_arena, rc.remote_path, rc.entries[i].name);
+                  String8 local_full = fs_path_join(frame_arena, local_path, rc.entries[i].name);
+                  xfer_enqueue(&xfer_queue, XFER_Kind_Download, local_full, remote_full, rc.entries[i].name,
+                               rc.host, rc.port, rc.user, rc.pass);
+                }
+              }
+            }
+            else if(!drag.from_remote && drop_in_remote && rc.connecting && !rc.control_joined)
+            {
+              for(U64 i = 0; i < local_entries.count; i += 1)
+              {
+                if(local_selected[i] && !local_entries.v[i].is_dir)
+                {
+                  String8 local_full = fs_path_join(frame_arena, local_path, local_entries.v[i].name);
+                  String8 remote_full = sftp_path_join(frame_arena, rc.remote_path, local_entries.v[i].name);
+                  xfer_enqueue(&xfer_queue, XFER_Kind_Upload, local_full, remote_full, local_entries.v[i].name,
+                               rc.host, rc.port, rc.user, rc.pass);
+                }
+              }
+            }
+          }
+          drag.active = 0;
+          drag.dragging = 0;
+        }
       }
     }
 
@@ -542,9 +729,97 @@ main(void)
           idx += 1;
         }
       }break;
-      case 1: { dr_text(&font, 14.0f, 10.0f, ui_text_baseline_y(content_y0, 26.0f, 14.0f), 0.5f, 0.5f, 0.5f, 1.0f, str8_lit("No transfers in progress.")); }break;
-      case 2: { dr_text(&font, 14.0f, 10.0f, ui_text_baseline_y(content_y0, 26.0f, 14.0f), 0.5f, 0.5f, 0.5f, 1.0f, str8_lit("No failed transfers.")); }break;
-      case 3: { dr_text(&font, 14.0f, 10.0f, ui_text_baseline_y(content_y0, 26.0f, 14.0f), 0.5f, 0.5f, 0.5f, 1.0f, str8_lit("No completed transfers.")); }break;
+      case 1: // Queue - Queued + InProgress, with a proportional-fill progress bar
+      {
+        F32 xr_h = 26.0f;
+        F32 xr_y0 = content_y0 + 4.0f;
+        U64 shown = 0;
+        for(U64 i = 0; i < xfer_queue.op_count; i += 1)
+        {
+          XFER_Op *op = &xfer_queue.ops[i];
+          if(op->status != XFER_Status_Queued && op->status != XFER_Status_InProgress)
+          {
+            continue;
+          }
+          F32 ry0 = xr_y0 + (F32)shown * xr_h;
+          String8 dir_glyph = (op->kind == XFER_Kind_Download) ? str8_lit("DL") : str8_lit("UL");
+          dr_text(&font, 12.0f, 10.0f, ui_text_baseline_y(ry0, xr_h, 12.0f), 0.6f, 0.6f, 0.8f, 1.0f, dir_glyph);
+          dr_text(&font, 13.0f, 40.0f, ui_text_baseline_y(ry0, xr_h, 13.0f), 0.85f, 0.85f, 0.85f, 1.0f, op->display_name);
+
+          F32 bar_x0 = 300.0f, bar_x1 = win_w - 110.0f, bar_y0 = ry0 + 6.0f, bar_y1 = ry0 + xr_h - 6.0f;
+          dr_rect(bar_x0, bar_y0, bar_x1, bar_y1, 0.15f, 0.15f, 0.17f, 1.0f);
+          if(op->status == XFER_Status_InProgress)
+          {
+            F32 frac = (op->size_total > 0) ? Clamp(0.0f, (F32)((F64)op->bytes_done / (F64)op->size_total), 1.0f) : 0.0f;
+            dr_rect(bar_x0, bar_y0, bar_x0 + (bar_x1 - bar_x0) * frac, bar_y1, 0.25f, 0.45f, 0.65f, 1.0f);
+          }
+          else
+          {
+            dr_text(&font, 12.0f, bar_x0 + 6.0f, ui_text_baseline_y(ry0, xr_h, 12.0f), 0.55f, 0.55f, 0.55f, 1.0f, str8_lit("queued"));
+          }
+
+          if(op->status == XFER_Status_Queued)
+          {
+            if(ui_button(&font, win_w - 96.0f, ry0 + 2.0f, 86.0f, xr_h - 4.0f, str8_lit("Remove")))
+            {
+              xfer_cancel_queued(&xfer_queue, i);
+              break; // indices shifted - resume next frame rather than iterate stale ones
+            }
+          }
+          shown += 1;
+        }
+        if(shown == 0)
+        {
+          dr_text(&font, 14.0f, 10.0f, ui_text_baseline_y(content_y0, 26.0f, 14.0f), 0.5f, 0.5f, 0.5f, 1.0f, str8_lit("No transfers in progress."));
+        }
+      }break;
+      case 2: // Failed
+      {
+        F32 xr_h = 26.0f;
+        F32 xr_y0 = content_y0 + 4.0f;
+        U64 shown = 0;
+        for(U64 i = 0; i < xfer_queue.op_count; i += 1)
+        {
+          XFER_Op *op = &xfer_queue.ops[i];
+          if(op->status != XFER_Status_Failed)
+          {
+            continue;
+          }
+          F32 ry0 = xr_y0 + (F32)shown * xr_h;
+          dr_text(&font, 13.0f, 10.0f, ui_text_baseline_y(ry0, xr_h, 13.0f), 0.85f, 0.6f, 0.6f, 1.0f, op->display_name);
+          dr_text(&font, 12.0f, 260.0f, ui_text_baseline_y(ry0, xr_h, 12.0f), 0.7f, 0.45f, 0.45f, 1.0f, op->error_text);
+          shown += 1;
+        }
+        if(shown == 0)
+        {
+          dr_text(&font, 14.0f, 10.0f, ui_text_baseline_y(content_y0, 26.0f, 14.0f), 0.5f, 0.5f, 0.5f, 1.0f, str8_lit("No failed transfers."));
+        }
+      }break;
+      case 3: // Completed
+      {
+        F32 xr_h = 26.0f;
+        F32 xr_y0 = content_y0 + 4.0f;
+        U64 shown = 0;
+        for(U64 i = 0; i < xfer_queue.op_count; i += 1)
+        {
+          XFER_Op *op = &xfer_queue.ops[i];
+          if(op->status != XFER_Status_Done)
+          {
+            continue;
+          }
+          F32 ry0 = xr_y0 + (F32)shown * xr_h;
+          String8 dir_glyph = (op->kind == XFER_Kind_Download) ? str8_lit("DL") : str8_lit("UL");
+          dr_text(&font, 12.0f, 10.0f, ui_text_baseline_y(ry0, xr_h, 12.0f), 0.6f, 0.8f, 0.6f, 1.0f, dir_glyph);
+          dr_text(&font, 13.0f, 40.0f, ui_text_baseline_y(ry0, xr_h, 13.0f), 0.85f, 0.85f, 0.85f, 1.0f, op->display_name);
+          String8 size_str = str8f(frame_arena, "%llu bytes", op->size_total);
+          dr_text(&font, 12.0f, 300.0f, ui_text_baseline_y(ry0, xr_h, 12.0f), 0.55f, 0.55f, 0.55f, 1.0f, size_str);
+          shown += 1;
+        }
+        if(shown == 0)
+        {
+          dr_text(&font, 14.0f, 10.0f, ui_text_baseline_y(content_y0, 26.0f, 14.0f), 0.5f, 0.5f, 0.5f, 1.0f, str8_lit("No completed transfers."));
+        }
+      }break;
     }
     dr_clear_clip();
 
@@ -557,6 +832,28 @@ main(void)
       {
         connect_to(&rc, modal_host, modal_port, modal_user, modal_pass);
       }
+    }
+    ui_settings_modal_update(&settings_modal, &xfer_settings, &font, win_w, win_h);
+
+    // Drag visual - drawn last (on top of the modal overlay too, though a
+    // drag and a modal can't really coexist in practice) so it always
+    // reads clearly regardless of what's under the cursor.
+    if(drag.dragging)
+    {
+      U64 count = 0;
+      if(drag.from_remote)
+      {
+        for(U64 i = 0; i < rc.entry_count; i += 1) { if(rc.selected[i] && !rc.entries[i].is_dir) { count += 1; } }
+      }
+      else
+      {
+        for(U64 i = 0; i < local_entries.count; i += 1) { if(local_selected[i] && !local_entries.v[i].is_dir) { count += 1; } }
+      }
+      String8 tag = str8f(frame_arena, "%llu item(s)", count);
+      F32 tag_w = 110.0f, tag_h = 26.0f;
+      F32 tag_x = ui_g_mouse_x + 14.0f, tag_y = ui_g_mouse_y + 14.0f;
+      dr_rect(tag_x, tag_y, tag_x + tag_w, tag_y + tag_h, 0.25f, 0.45f, 0.65f, 0.92f);
+      dr_text(&font, 13.0f, tag_x + 8.0f, ui_text_baseline_y(tag_y, tag_h, 13.0f), 1.0f, 1.0f, 1.0f, 1.0f, tag);
     }
 
     dr_end_frame();

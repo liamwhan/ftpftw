@@ -89,6 +89,7 @@
 
 #define MemoryZero(s, z)      memset((s), 0, (z))
 #define MemoryZeroStruct(s)   MemoryZero((s), sizeof(*(s)))
+#define MemoryZeroArray(a)    MemoryZero((a), sizeof(a))
 
 #define MemoryMatch(a, b, z)    (MemoryCompare((a), (b), (z)) == 0)
 

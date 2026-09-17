@@ -121,3 +121,96 @@ fs_list_dir(Arena *arena, String8 path)
   scratch_end(scratch);
   return result;
 }
+
+internal WCHAR *
+fs__wide_from_path(Arena *arena, String8 path)
+{
+  int wide_count = MultiByteToWideChar(CP_UTF8, 0, (char *)path.str, (int)path.size, 0, 0);
+  WCHAR *wide = push_array_no_zero(arena, WCHAR, wide_count + 1);
+  MultiByteToWideChar(CP_UTF8, 0, (char *)path.str, (int)path.size, wide, wide_count);
+  wide[wide_count] = 0;
+  return wide;
+}
+
+internal FS_File
+fs_file_open_read(String8 path)
+{
+  Temp scratch = scratch_begin(0, 0);
+  WCHAR *wide = fs__wide_from_path(scratch.arena, path);
+  HANDLE h = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+  scratch_end(scratch);
+  FS_File result = {(U64)h};
+  return result;
+}
+
+internal FS_File
+fs_file_open_write(String8 path)
+{
+  Temp scratch = scratch_begin(0, 0);
+  WCHAR *wide = fs__wide_from_path(scratch.arena, path);
+  HANDLE h = CreateFileW(wide, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+  scratch_end(scratch);
+  FS_File result = {(U64)h};
+  return result;
+}
+
+internal B32
+fs_file_is_valid(FS_File file)
+{
+  HANDLE h = (HANDLE)PtrFromInt(file.u64[0]);
+  return h != 0 && h != INVALID_HANDLE_VALUE;
+}
+
+internal U64
+fs_file_read(FS_File file, void *buf, U64 max_size)
+{
+  HANDLE h = (HANDLE)PtrFromInt(file.u64[0]);
+  DWORD read_bytes = 0;
+  BOOL ok = ReadFile(h, buf, (DWORD)max_size, &read_bytes, 0);
+  return ok ? (U64)read_bytes : 0;
+}
+
+internal B32
+fs_file_write(FS_File file, void *buf, U64 size)
+{
+  HANDLE h = (HANDLE)PtrFromInt(file.u64[0]);
+  U8 *p = (U8 *)buf;
+  U64 remaining = size;
+  while(remaining > 0)
+  {
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, p, (DWORD)remaining, &written, 0);
+    if(!ok || written == 0)
+    {
+      return 0;
+    }
+    p += written;
+    remaining -= written;
+  }
+  return 1;
+}
+
+internal void
+fs_file_close(FS_File file)
+{
+  HANDLE h = (HANDLE)PtrFromInt(file.u64[0]);
+  if(h != 0 && h != INVALID_HANDLE_VALUE)
+  {
+    CloseHandle(h);
+  }
+}
+
+internal B32
+fs_file_size(String8 path, U64 *out_size)
+{
+  Temp scratch = scratch_begin(0, 0);
+  WCHAR *wide = fs__wide_from_path(scratch.arena, path);
+  WIN32_FILE_ATTRIBUTE_DATA data = {0};
+  BOOL ok = GetFileAttributesExW(wide, GetFileExInfoStandard, &data);
+  scratch_end(scratch);
+  if(ok)
+  {
+    *out_size = ((U64)data.nFileSizeHigh << 32) | data.nFileSizeLow;
+  }
+  return ok != 0;
+}

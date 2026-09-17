@@ -4,11 +4,15 @@ global F32 ui_g_mouse_x = 0.0f;
 global F32 ui_g_mouse_y = 0.0f;
 global B32 ui_g_mouse_left_down = 0;
 global B32 ui_g_mouse_left_was_down = 0; // previous frame's value, for edge detection
+global B32 ui_g_ctrl_down = 0;
+global B32 ui_g_shift_down = 0;
 
 internal void
 ui_begin_frame(WM_Window window)
 {
   wm_mouse_state(window, &ui_g_mouse_x, &ui_g_mouse_y, &ui_g_mouse_left_down);
+  B32 alt_unused;
+  wm_key_modifiers(&ui_g_ctrl_down, &ui_g_shift_down, &alt_unused);
 }
 
 internal void
@@ -68,7 +72,7 @@ ui_tab_strip(FP_Font *font, F32 x, F32 y, F32 tab_w, F32 tab_h,
 
 internal S32
 ui_row_list(Arena *frame_arena, FP_Font *font, F32 x, F32 y, F32 width, F32 height, F32 row_h,
-             FS_Entry *entries, U64 entry_count,
+             FS_Entry *entries, U64 entry_count, B32 *selected,
              UI_RowListState *state, B32 *out_double_clicked)
 {
   S32 clicked = -1;
@@ -99,8 +103,13 @@ ui_row_list(Arena *frame_arena, FP_Font *font, F32 x, F32 y, F32 width, F32 heig
       continue; // fully outside the visible pane - clip would hide it anyway, this just saves instances
     }
     B32 hovered = mouse_in_pane && ui__point_in_rect(ui_g_mouse_x, ui_g_mouse_y, x, ry0, x + width, ry1);
+    B32 is_selected = selected[i];
 
-    if(hovered)
+    if(is_selected)
+    {
+      dr_rect(x, ry0, x + width, ry1, 0.20f, 0.32f, 0.45f, 1.0f);
+    }
+    else if(hovered)
     {
       dr_rect(x, ry0, x + width, ry1, 0.18f, 0.18f, 0.20f, 1.0f);
     }
@@ -134,6 +143,43 @@ ui_row_list(Arena *frame_arena, FP_Font *font, F32 x, F32 y, F32 width, F32 heig
       }
       state->last_click_index = (S32)i;
       state->last_click_time_us = now;
+
+      if(ui_g_ctrl_down)
+      {
+        selected[i] = !selected[i];
+        state->shift_anchor_index = (S32)i;
+      }
+      else if(ui_g_shift_down)
+      {
+        S32 anchor = (state->shift_anchor_index >= 0) ? state->shift_anchor_index : (S32)i;
+        S32 lo = Min(anchor, (S32)i);
+        S32 hi = Max(anchor, (S32)i);
+        for(U64 j = 0; j < entry_count; j += 1)
+        {
+          selected[j] = ((S32)j >= lo && (S32)j <= hi);
+        }
+        // anchor deliberately not moved - repeated shift-clicks extend/shrink from the same start
+      }
+      else
+      {
+        // Plain click selects only this row - UNLESS it's already part of
+        // a multi-selection, in which case leave the selection untouched.
+        // Without this, pressing down on one of several already-selected
+        // rows to start dragging the whole group would collapse the
+        // selection to just that one row before the drag even begins
+        // (this click-handling runs before the caller's own drag-arming
+        // logic sees the selection). To shrink a multi-selection down to
+        // one item, click a row that isn't already selected.
+        if(!selected[i])
+        {
+          for(U64 j = 0; j < entry_count; j += 1)
+          {
+            selected[j] = 0;
+          }
+          selected[i] = 1;
+        }
+        state->shift_anchor_index = (S32)i;
+      }
     }
   }
 
@@ -283,6 +329,23 @@ ui_icon_button(F32 x, F32 y, F32 size, F32 u0, F32 v0, F32 u1, F32 v1)
   F32 pad = size * 0.22f;
   F32 tint = hovered ? 1.0f : 0.75f;
   dr_image(x + pad, y + pad, x + size - pad, y + size - pad, u0, v0, u1, v1, tint, tint, tint, 1.0f);
+
+  return hovered && pressed;
+}
+
+internal B32
+ui_button(FP_Font *font, F32 x, F32 y, F32 w, F32 h, String8 label)
+{
+  B32 hovered = ui__point_in_rect(ui_g_mouse_x, ui_g_mouse_y, x, y, x + w, y + h);
+  B32 pressed = ui__mouse_pressed_edge();
+  F32 bg = hovered ? 0.26f : 0.20f;
+  dr_rect(x, y, x + w, y + h, bg, bg, bg, 1.0f);
+
+  F32 advance = 0.0f;
+  FNT_Piece measure[64];
+  fnt_text_pieces(font, 14.0f, label, 0, 0, measure, ArrayCount(measure), &advance);
+  F32 text_x = x + (w - advance) * 0.5f;
+  dr_text(font, 14.0f, text_x, ui_text_baseline_y(y, h, 14.0f), 0.9f, 0.9f, 0.9f, 1.0f, label);
 
   return hovered && pressed;
 }

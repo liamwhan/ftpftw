@@ -199,6 +199,14 @@ wm_mouse_wheel_delta(void)
   return result;
 }
 
+internal void
+wm_key_modifiers(B32 *out_ctrl, B32 *out_shift, B32 *out_alt)
+{
+  *out_ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+  *out_shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+  *out_alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+}
+
 internal U64
 wm_clipboard_get_text(U8 *out_buf, U64 out_buf_cap)
 {
