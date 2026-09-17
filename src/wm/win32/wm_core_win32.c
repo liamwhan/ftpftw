@@ -74,6 +74,30 @@ wm_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
       S16 delta_raw = (S16)HIWORD(wparam);
       wm_g_wheel_delta += (F32)delta_raw / (F32)WHEEL_DELTA;
     }break;
+
+    case WM_CHAR:
+    {
+      // Control characters (backspace, tab, enter, escape, ...) also arrive
+      // here as well as WM_KEYDOWN - only take the printable ones from
+      // WM_CHAR and handle editing keys exclusively via WM_KEYDOWN below, so
+      // a single keypress doesn't get handled twice.
+      if(wparam >= 0x20 && wm_g_raw_event_count < ArrayCount(wm_g_raw_events))
+      {
+        wm_g_raw_events[wm_g_raw_event_count].kind = WM_EventKind_Char;
+        wm_g_raw_events[wm_g_raw_event_count].code = (U32)wparam;
+        wm_g_raw_event_count += 1;
+      }
+    }break;
+
+    case WM_KEYDOWN:
+    {
+      if(wm_g_raw_event_count < ArrayCount(wm_g_raw_events))
+      {
+        wm_g_raw_events[wm_g_raw_event_count].kind = WM_EventKind_KeyDown;
+        wm_g_raw_events[wm_g_raw_event_count].code = (U32)wparam;
+        wm_g_raw_event_count += 1;
+      }
+    }break;
   }
   return result;
 }

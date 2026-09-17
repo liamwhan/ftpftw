@@ -4,6 +4,7 @@ global struct
 {
   F32 folder_u0, folder_v0, folder_u1, folder_v1;
   F32 file_u0, file_v0, file_u1, file_v1;
+  F32 conn_u0, conn_v0, conn_u1, conn_v1;
 }
 ui_icons_g;
 
@@ -55,6 +56,33 @@ ui_icons__make_file_bitmap(U8 *pixels, U32 dim)
 }
 
 internal void
+ui_icons__make_conn_bitmap(U8 *pixels, U32 dim)
+{
+  // Two overlapping filled squares - a plain "things joined together" glyph
+  // for the Connections toolbar button. Same flat-fill style as the
+  // folder/file icons above - a placeholder look by design, easy to swap
+  // for something nicer later (see CLAUDE.md on hand-drawn icons).
+  MemoryZero(pixels, dim * dim);
+  U32 sq = dim * 5 / 8;
+  U32 off = dim / 6;
+  for(U32 y = off; y < dim && y < off + sq; y += 1)
+  {
+    for(U32 x = 0; x < sq && x < dim; x += 1)
+    {
+      pixels[y * dim + x] = 255;
+    }
+  }
+  U32 bx0 = dim - sq;
+  for(U32 y = 0; y < sq && y < dim; y += 1)
+  {
+    for(U32 x = bx0; x < dim; x += 1)
+    {
+      pixels[y * dim + x] = 255;
+    }
+  }
+}
+
+internal void
 ui_icons_init(void)
 {
   U8 bitmap[UI_ICON_DIM * UI_ICON_DIM];
@@ -68,6 +96,11 @@ ui_icons_init(void)
   fnt_atlas_pack_bitmap(bitmap, UI_ICON_DIM, UI_ICON_DIM,
                          &ui_icons_g.file_u0, &ui_icons_g.file_v0,
                          &ui_icons_g.file_u1, &ui_icons_g.file_v1);
+
+  ui_icons__make_conn_bitmap(bitmap, UI_ICON_DIM);
+  fnt_atlas_pack_bitmap(bitmap, UI_ICON_DIM, UI_ICON_DIM,
+                         &ui_icons_g.conn_u0, &ui_icons_g.conn_v0,
+                         &ui_icons_g.conn_u1, &ui_icons_g.conn_v1);
 }
 
 internal void
@@ -83,4 +116,11 @@ ui_icon_uv(B32 is_dir, F32 *out_u0, F32 *out_v0, F32 *out_u1, F32 *out_v1)
     *out_u0 = ui_icons_g.file_u0; *out_v0 = ui_icons_g.file_v0;
     *out_u1 = ui_icons_g.file_u1; *out_v1 = ui_icons_g.file_v1;
   }
+}
+
+internal void
+ui_icon_conn_uv(F32 *out_u0, F32 *out_v0, F32 *out_u1, F32 *out_v1)
+{
+  *out_u0 = ui_icons_g.conn_u0; *out_v0 = ui_icons_g.conn_v0;
+  *out_u1 = ui_icons_g.conn_u1; *out_v1 = ui_icons_g.conn_v1;
 }

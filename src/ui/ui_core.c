@@ -141,3 +141,134 @@ ui_row_list(Arena *frame_arena, FP_Font *font, F32 x, F32 y, F32 width, F32 heig
 
   return clicked;
 }
+
+internal void
+ui_text_edit_set(UI_TextEditState *state, String8 s)
+{
+  U64 n = Min(s.size, sizeof(state->buffer) - 1);
+  MemoryCopy(state->buffer, s.str, n);
+  state->len = n;
+  state->cursor = n;
+}
+
+internal void
+ui_text_edit_set_u16(UI_TextEditState *state, U16 value)
+{
+  char buf[8];
+  int n = snprintf(buf, sizeof(buf), "%u", (unsigned)value);
+  U64 un = (U64)ClampBot(0, n);
+  un = Min(un, sizeof(state->buffer) - 1);
+  MemoryCopy(state->buffer, buf, un);
+  state->len = un;
+  state->cursor = un;
+}
+
+internal String8
+ui_text_edit_str8(UI_TextEditState *state)
+{
+  return str8(state->buffer, state->len);
+}
+
+internal B32
+ui_text_edit(WM_EventList *events, FP_Font *font, F32 x, F32 y, F32 w, F32 h,
+              UI_TextEditState *state, B32 focused, B32 mask)
+{
+  B32 pressed = ui__mouse_pressed_edge();
+  B32 hovered = ui__point_in_rect(ui_g_mouse_x, ui_g_mouse_y, x, y, x + w, y + h);
+  B32 clicked = hovered && pressed;
+
+  if(focused)
+  {
+    for(WM_Event *ev = events->first; ev != 0; ev = ev->next)
+    {
+      if(ev->kind == WM_EventKind_Char)
+      {
+        if(state->len < sizeof(state->buffer) - 1)
+        {
+          MemoryCopy(state->buffer + state->cursor + 1, state->buffer + state->cursor, state->len - state->cursor);
+          state->buffer[state->cursor] = (U8)ev->code;
+          state->len += 1;
+          state->cursor += 1;
+        }
+      }
+      else if(ev->kind == WM_EventKind_KeyDown)
+      {
+        switch(ev->code)
+        {
+          case VK_BACK:
+          {
+            if(state->cursor > 0)
+            {
+              MemoryCopy(state->buffer + state->cursor - 1, state->buffer + state->cursor, state->len - state->cursor);
+              state->cursor -= 1;
+              state->len -= 1;
+            }
+          }break;
+          case VK_DELETE:
+          {
+            if(state->cursor < state->len)
+            {
+              MemoryCopy(state->buffer + state->cursor, state->buffer + state->cursor + 1, state->len - state->cursor - 1);
+              state->len -= 1;
+            }
+          }break;
+          case VK_LEFT:  { if(state->cursor > 0) { state->cursor -= 1; } }break;
+          case VK_RIGHT: { if(state->cursor < state->len) { state->cursor += 1; } }break;
+          case VK_HOME:  { state->cursor = 0; }break;
+          case VK_END:   { state->cursor = state->len; }break;
+          default: break;
+        }
+      }
+    }
+  }
+
+  F32 bg = focused ? 0.20f : (hovered ? 0.16f : 0.13f);
+  dr_rect(x, y, x + w, y + h, bg, bg, bg, 1.0f);
+
+  U8 mask_buf[256];
+  String8 display;
+  if(mask)
+  {
+    MemorySet(mask_buf, '*', state->len);
+    display = str8(mask_buf, state->len);
+  }
+  else
+  {
+    display = str8(state->buffer, state->len);
+  }
+  dr_text(font, 14.0f, x + 6.0f, ui_text_baseline_y(y, h, 14.0f), 0.9f, 0.9f, 0.9f, 1.0f, display);
+
+  if(focused)
+  {
+    F32 cursor_advance = 0.0f;
+    if(state->cursor > 0)
+    {
+      FNT_Piece measure_pieces[300];
+      String8 pre = mask ? str8(mask_buf, state->cursor) : str8(state->buffer, state->cursor);
+      fnt_text_pieces(font, 14.0f, pre, 0, 0, measure_pieces, ArrayCount(measure_pieces), &cursor_advance);
+    }
+    F32 cursor_x = x + 6.0f + cursor_advance;
+    dr_rect(cursor_x, y + 4.0f, cursor_x + 1.5f, y + h - 4.0f, 0.9f, 0.9f, 0.9f, 1.0f);
+  }
+
+  return clicked;
+}
+
+internal B32
+ui_icon_button(F32 x, F32 y, F32 size, F32 u0, F32 v0, F32 u1, F32 v1)
+{
+  B32 hovered = ui__point_in_rect(ui_g_mouse_x, ui_g_mouse_y, x, y, x + size, y + size);
+  B32 pressed = ui__mouse_pressed_edge();
+
+  if(hovered)
+  {
+    F32 bg = 0.22f;
+    dr_rect(x, y, x + size, y + size, bg, bg, bg, 1.0f);
+  }
+
+  F32 pad = size * 0.22f;
+  F32 tint = hovered ? 1.0f : 0.75f;
+  dr_image(x + pad, y + pad, x + size - pad, y + size - pad, u0, v0, u1, v1, tint, tint, tint, 1.0f);
+
+  return hovered && pressed;
+}

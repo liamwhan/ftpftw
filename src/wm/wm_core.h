@@ -18,6 +18,8 @@ enum
 {
   WM_EventKind_Close,
   WM_EventKind_Resize,
+  WM_EventKind_Char,    // a typed character - code is the codepoint (BMP/ASCII)
+  WM_EventKind_KeyDown, // a non-character key - code is the VK_* virtual-key code
 };
 
 typedef struct WM_Event WM_Event;
@@ -27,6 +29,7 @@ struct WM_Event
   WM_EventKind kind;
   U32 width;  // WM_EventKind_Resize: new client-area size, in pixels
   U32 height;
+  U32 code;   // WM_EventKind_Char: codepoint. WM_EventKind_KeyDown: VK_* code.
 };
 
 typedef struct WM_EventList WM_EventList;
