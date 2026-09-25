@@ -110,7 +110,12 @@ if not exist build mkdir build
 :: submodule).
 set libssh2_dir=..\third_party\libssh2
 set libssh2_flags=-I%libssh2_dir%\include -I%libssh2_dir%\src -DLIBSSH2_WINCNG
-set libssh2_sources=agent bcrypt_pbkdf blowfish chacha channel cipher-chachapoly comp crypt global hostkey keepalive kex knownhost mac misc packet pem poly1305 publickey scp session sftp transport userauth userauth_kbd_packet version wincng
+:: crypto.c, not wincng.c, is the compiled translation unit: wincng.c's
+:: body is gated behind `#ifdef LIBSSH2_CRYPTO_C` (see crypto.c) so it
+:: only compiles when pulled in via crypto.c's own #include - compiling
+:: wincng.c directly silently produces an empty object (no error, just
+:: an empty .obj) and every WinCNG symbol ends up unresolved at link time.
+set libssh2_sources=agent bcrypt_pbkdf blowfish chacha channel cipher-chachapoly comp crypt crypto global hostkey keepalive kex knownhost mac misc packet pem poly1305 publickey scp session sftp transport userauth userauth_kbd_packet version
 set libssh2_libs=libssh2.lib crypt32.lib bcrypt.lib ws2_32.lib
 set gui_libs=d3d11.lib dxgi.lib d3dcompiler.lib dwrite.lib user32.lib
 
