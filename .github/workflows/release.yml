@@ -1,0 +1,96 @@
+name: Release
+
+# Versioning: git tags are the source of truth, vMAJOR.MINOR.PATCH (e.g.
+# v1.2.3). Pushing a tag matching that pattern builds a release MSVC
+# binary and publishes it as a GitHub Release with the tag as its name.
+# The tag's version (without the leading "v") is stamped into the .exe
+# at compile time as FTW_VERSION (see src/version.h, build.bat) - this
+# is also what a future in-app update checker should compare against
+# this repo's /releases/latest API response.
+#
+# To cut a release:
+#   git tag v1.2.3
+#   git push origin v1.2.3
+#
+# workflow_dispatch re-runs the same build+publish for a tag that
+# already exists (e.g. after a failed run) without needing a new tag.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and release (e.g. v1.2.3)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Derive version from tag
+        id: version
+        shell: bash
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          version="${tag#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$tag' is not a valid vMAJOR.MINOR.PATCH tag" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          submodules: false
+
+      # Only third_party/libssh2 is needed to build - it's compiled from
+      # source by build.bat. The raddebugger submodule is a read-only
+      # reference vendored for its conventions (see README), not linked
+      # against, and it's registered over SSH in .gitmodules which the
+      # runner has no credentials for - so it's deliberately left
+      # uninitialized here rather than pulled in via a recursive checkout.
+      - name: Init libssh2 submodule
+        shell: bash
+        run: git submodule update --init third_party/libssh2
+
+      - name: Build (release)
+        shell: cmd
+        env:
+          FTW_VERSION: ${{ steps.version.outputs.version }}
+        run: build.bat release
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $hash = Get-FileHash build\ftp-ftw.exe -Algorithm SHA256
+          "$($hash.Hash.ToLower())  ftp-ftw.exe" | Out-File -Encoding ascii -NoNewline build\ftp-ftw.exe.sha256
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            build/ftp-ftw.exe \
+            build/ftp-ftw.exe.sha256 \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.tag.outputs.tag }}" \
+            --generate-notes
