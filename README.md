@@ -116,8 +116,7 @@ native code.
 
 ## Security
 
-Security work isn't an afterthought bolted on before a 1.0 tag — see
-[`CLAUDE.md`](CLAUDE.md) for the full engineering philosophy, but the
+Security work isn't an afterthought bolted on before a 1.0 tag — the
 concrete guarantees today:
 
 - **SSH host key verification.** Every new server is trust-on-first-use
@@ -208,8 +207,7 @@ Plain FTP/FTPS and public-key authentication are deliberately out of
 scope for now (this client is built for the common case: your own
 servers, SFTP, username/password). The GUI is built directly on top of
 an already-concurrent, already-working console-proven engine, per the
-project's own phased build order — see `CLAUDE.md` for the full
-roadmap and current status in detail.
+project's own phased build order.
 
 ## Acknowledgments
 
@@ -225,4 +223,4 @@ roadmap and current status in detail.
 
 ## License
 
-Not yet decided.
+MIT
